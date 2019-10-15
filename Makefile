@@ -3,7 +3,7 @@ CPPFLAGS= -Wextra -Wall -std=c++1z
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
-	CPP=g++-9
+	CPP=clang++
 endif
 
 isa-tazatel: isa-tazatel.cpp

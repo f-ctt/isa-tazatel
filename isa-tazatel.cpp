@@ -14,11 +14,15 @@
 #include <unordered_map>
 #include <functional>
 #include <unistd.h>
+#include <mutex>
 
 using namespace std;
 
-#define STDERR(x) do { cerr << __func__ << ":" <<__LINE__ << ": " << x << endl; } while (0)
-#define STDOUT(x) do { cout << x << endl; } while (0)
+static mutex STDOUT_MX;
+static mutex STDERR_MX;
+
+#define STDERR(x) do { STDERR_MX.lock();cerr << __func__ << ":" <<__LINE__ << ": " << x << endl; STDERR_MX.unlock(); } while (0)
+#define STDOUT(x) do { STDOUT_MX.lock(); cout << x << endl; STDOUT_MX.unlock(); } while (0)
 
 enum QTYPE {
     a = 1,      // An A record for the domain name
@@ -30,27 +34,35 @@ enum QTYPE {
     aaaa = 28 	// An AAAA record(s) for the domain name
 };
 
-struct DNSQuery {
-    string dname;
-    unsigned qtype;
-    int af;
-    union {
-        struct in6_addr in6;
-        struct in_addr in;
-    };
-    DNSQuery(string dname, unsigned qtype, int af, struct in6_addr in6) :
-        dname(dname), qtype(qtype), af(af), in6(in6) { }
-    DNSQuery(string dname, unsigned qtype, int af, struct in_addr in) :
-        dname(dname), qtype(qtype), af(af), in(in) { }
-};
-
 
 class ResourceRecord {
     public:
         virtual string toString() = 0;
-        virtual unique_ptr<DNSQuery> asQuery() = 0;
+        virtual string asQuery() = 0;
         virtual unsigned qtype() const = 0;
         virtual vector<QTYPE> asQueryTo() = 0;
+};
+
+struct RRNode {
+    unique_ptr<ResourceRecord> record; 
+    vector<struct RRNode> children;
+    void printTree() {
+        for (auto &child : children)
+            child.printTree();
+        cout << record->toString() << endl;
+    }
+};
+
+class MX : public ResourceRecord {
+    private:
+        uint16_t pref;
+        string exch;
+    public:
+        MX(uint16_t pref, string exch) : pref(pref), exch(exch) {}
+        string asQuery() { return string(); }
+        string toString() { return string(to_string(pref).append(" ") + exch); }
+        unsigned qtype() const { return QTYPE::mx; }
+        vector<QTYPE> asQueryTo() { return vector<QTYPE>(); }
 };
 
 class PTR : public ResourceRecord {
@@ -58,7 +70,7 @@ class PTR : public ResourceRecord {
         string name;
     public:
         PTR(string name) : name(name) {}
-        unique_ptr<DNSQuery> asQuery() { return nullptr; } // TODO: unimplemented
+        string asQuery() { return this->toString(); } 
         unsigned qtype() const { return QTYPE::ptr; }
         vector<QTYPE> asQueryTo() { 
             return vector<QTYPE>
@@ -83,10 +95,10 @@ class SOA : public ResourceRecord {
 
         unsigned qtype() const { return QTYPE::soa; }
 
-        unique_ptr<DNSQuery> asQuery() { return nullptr; } 
+        string asQuery() { return string(); } 
 
         string toString() {
-            return string(mname.append("\n").append(rname));
+            return string(mname.append(" ").append(rname));
         }
 };
 
@@ -106,15 +118,12 @@ class A : public ResourceRecord {
                 throw runtime_error("inet_ntop zhorel a nemel");
             return string(buf);
         }
-        unique_ptr<DNSQuery> asQuery() {
+        string asQuery() {
+            struct in_addr tmp = addr;
+            addr.s_addr = htonl(addr.s_addr);
             auto dname = this->toString();
-            reverse(dname.begin(), dname.end());
-            return make_unique<DNSQuery>(DNSQuery(
-                dname.append(".in-addr.arpa"),
-                0,
-                AF_INET,
-                addr
-            ));
+            addr = tmp;
+            return dname.append(".in-addr.arpa");
         }
 };
 
@@ -135,15 +144,14 @@ class AAAA : public ResourceRecord {
             return string(buf);
         }
 
-        unique_ptr<DNSQuery> asQuery() {
-            auto dname = this->toString();
-            reverse(dname.begin(), dname.end());
-            return make_unique<DNSQuery>(DNSQuery(
-                dname.append(".ip6.arpa"),
-                0,
-                AF_INET6,
-                addr
-            ));
+        string asQuery() {
+            struct in6_addr tmp = addr;
+            for (auto &v : tmp.__in6_u.__u6_addr16) { //FIXME: I highly doubt this is fine
+                v = htons(v);
+            }
+            string dname = this->toString();
+            addr = tmp;
+            return dname.append(".ip6.arpa"); 
         }
 };
 
@@ -209,32 +217,27 @@ void init_resparser(const u_char *buffer, int size, ns_msg &handle, u_char **cp,
 }
 
 static
-void parse_mx(const u_char *buffer, int size, vector<unique_ptr<ResourceRecord>> &records) {
+vector<unique_ptr<ResourceRecord>> parse_mx(const u_char *buffer, int size) {
     ns_msg handle;
     ns_rr rr;
     int ret = 0;
     u_char *cp = NULL;
     char dname[NS_MAXDNAME] = {0};
     int msg_count = 0;
+    vector<unique_ptr<ResourceRecord>> records;
 
     if ((ret = ns_initparse(buffer, size, &handle)) < 0) {
         STDERR(hstrerror(ret));
         throw exception();
     }
     msg_count = ns_msg_count(handle, ns_s_an);
-
-    //record.append("\nMX: ");
     for (int i = 0; i < msg_count; ++i) {
         if ((ret = ns_parserr(&handle, ns_s_an, i, &rr)) < 0) {
             STDERR(hstrerror(ret));
             throw exception();
         }
         cp = (u_char *)ns_rr_rdata(rr);
-
-        // PREFERENCE
-        //record.append("\t" + to_string(ns_get16(cp)));
-
-        // EXCHANGE
+        uint16_t pref = ns_get16(cp);
         cp += 2;
         if ((ret = ns_name_uncompress(ns_msg_base(handle), 
             ns_msg_end(handle), 
@@ -244,100 +247,86 @@ void parse_mx(const u_char *buffer, int size, vector<unique_ptr<ResourceRecord>>
                 STDERR(hstrerror(ret));
                 throw exception();
         }
-        //record.append(" " + string(dname) + "\n");
+        records.push_back(make_unique<MX>(MX(pref, dname)));
     }
+    return records;
 }
 
 static
-void parse_a(const u_char *buffer, int size, vector<unique_ptr<ResourceRecord>> &records) {
+vector<unique_ptr<ResourceRecord>>parse_a(const u_char *buffer, int size) {
     ns_msg handle;
     ns_rr rr;
     int ret = 0;
     u_char *cp = NULL;
-    char buf[INET_ADDRSTRLEN] = {0};
     int msg_count = 0;
+    vector<unique_ptr<ResourceRecord>> records;
 
     if ((ret = ns_initparse(buffer, size, &handle)) < 0) {
         STDERR(hstrerror(ret));
         throw exception();
     }
     msg_count = ns_msg_count(handle, ns_s_an);
-
-    //record.append("A: ");
-
     for (int i = 0; i < msg_count; ++i) {
         if ((ret = ns_parserr(&handle, ns_s_an, i, &rr)) < 0) {
             STDERR(hstrerror(ret));
             throw exception();
         }
         cp = (u_char *)ns_rr_rdata(rr);
-
-        if (inet_ntop(AF_INET, cp, buf, sizeof(buf)) == NULL) {
-            STDERR(strerror(errno));
-            throw exception();
-        }
-        //record.append("\t" + string(buf) + "\n");       
+        struct in_addr addr;
+        memcpy(&addr, cp, sizeof(addr));
+        records.push_back(make_unique<A>(A(addr)));
     }
+    return records;
 }
 
 static
-void parse_aaaa(const u_char *buffer, int size, vector<unique_ptr<ResourceRecord>> &rcords) {
+vector<unique_ptr<ResourceRecord>> parse_aaaa(const u_char *buffer, int size) {
     ns_msg handle;
     ns_rr rr;
     int ret = 0;
     u_char *cp = NULL;
-    char buf[INET6_ADDRSTRLEN] = {0};
     int msg_count = 0;
+    vector<unique_ptr<ResourceRecord>> records;
 
     if ((ret = ns_initparse(buffer, size, &handle)) < 0) {
         STDERR(hstrerror(ret));
         throw exception();
     }
     msg_count = ns_msg_count(handle, ns_s_an);
-
-    //record.append("AAAA: ");
-
     for (int i = 0; i < msg_count; ++i) {
         if ((ret = ns_parserr(&handle, ns_s_an, i, &rr)) < 0) {
             STDERR(hstrerror(ret));
             throw exception();
         }
         cp = (u_char *)ns_rr_rdata(rr);
-
-        if (inet_ntop(AF_INET6, cp, buf, sizeof(buf)) == NULL) {
-            STDERR(strerror(errno));
-            throw exception();
-        }
-        //record.append("\t" + string(buf) + "\n");       
+        struct in6_addr addr;
+        memcpy(&addr, cp, sizeof(addr));
+        records.push_back(make_unique<AAAA>(AAAA(addr)));
     }
+    return records;
 }
 
 static
-void parse_ptr(const u_char *buffer, int size, vector<unique_ptr<ResourceRecord>> &records) {
+vector<unique_ptr<ResourceRecord>> parse_ptr(const u_char *buffer, int size) {
     ns_msg handle;
     ns_rr rr;
     int ret = 0;
     u_char *cp = NULL;
     char dname[NS_MAXDNAME] = {0};
     int msg_count = 0;
+    vector<unique_ptr<ResourceRecord>> records;
 
     if ((ret = ns_initparse(buffer, size, &handle)) < 0) {
         STDERR(hstrerror(ret));
         throw exception();
     }
-
     msg_count = ns_msg_count(handle, ns_s_an);
-
-    //record.append("PTR: ");
-
     for (int i = 0; i < msg_count; ++i) {
         if ((ret = ns_parserr(&handle, ns_s_an, i, &rr)) < 0) {
             STDERR(hstrerror(ret));
             throw exception();
         }
-
         cp = (u_char *)ns_rr_rdata(rr);
-
         if ((ret = ns_name_uncompress(
             ns_msg_base(handle), 
             ns_msg_end(handle), 
@@ -347,23 +336,22 @@ void parse_ptr(const u_char *buffer, int size, vector<unique_ptr<ResourceRecord>
                 STDERR(hstrerror(ret));
                 throw exception();
         }
-        //record.append("\t" + string(dname) + "\n"); 
+        records.push_back(make_unique<PTR>(PTR(dname)));
     }
+    return records;
 }
 
 static // TODO: if SOA not present, parse auth section
-void parse_soa(const u_char *buffer, int size, vector<unique_ptr<ResourceRecord>> &records) {
+vector<unique_ptr<ResourceRecord>> parse_soa(const u_char *buffer, int size) {
     ns_msg handle;
     ns_rr rr;
     int ret = 0;
     u_char *cp = NULL;
     char dname[NS_MAXDNAME] = {0};
     int msg_count = 0;
-    string mname, rname;
+    vector<unique_ptr<ResourceRecord>> records;
 
     init_resparser(buffer, size, handle, &cp, rr, msg_count);
-
-    // MNAME
     if ((ret = ns_name_uncompress(ns_msg_base(handle), 
                                 ns_msg_end(handle), 
                                 cp, 
@@ -372,9 +360,8 @@ void parse_soa(const u_char *buffer, int size, vector<unique_ptr<ResourceRecord>
             STDERR(hstrerror(ret));
             throw exception();
     }
-    mname.append(dname);
+    string mname(dname);
     cp += ret;
-    // RNAME
     if ((ret = ns_name_uncompress(ns_msg_base(handle), 
         ns_msg_end(handle), 
         cp, 
@@ -383,13 +370,14 @@ void parse_soa(const u_char *buffer, int size, vector<unique_ptr<ResourceRecord>
             STDERR(hstrerror(ret));
             throw exception();
     }
-    rname.append(dname);
+    string rname(dname);
     records.push_back(make_unique<SOA>(SOA(mname, rname)));
+    return records;
 }
 
 static
 vector<unique_ptr<ResourceRecord>> dns2str(unsigned type, const u_char *buffer, int size) { 
-    static unordered_map<unsigned, function<void(const u_char *buffer, int size, vector<unique_ptr<ResourceRecord>> &records)>> nsTypeParse {
+    static unordered_map<unsigned, function<vector<unique_ptr<ResourceRecord>>(const u_char *buffer, int size)>> nsTypeParse {
         { ns_t_soa, parse_soa },
         { ns_t_mx, parse_mx },
         { ns_t_aaaa, parse_aaaa },
@@ -402,85 +390,80 @@ vector<unique_ptr<ResourceRecord>> dns2str(unsigned type, const u_char *buffer, 
         return records;
     }
 
-    it->second(buffer, size, records);
-    return records;
+    return it->second(buffer, size);
 }
 
-struct RRNode {
-    unique_ptr<ResourceRecord> record; 
-    vector<struct RRNode> children;  
-};
 
 static
-void query_test(unique_ptr<DNSQuery> query, vector<RRNode> &root) {
-    struct __res_state res;
-    res_9_sockaddr_union u[1];
+vector<RRNode> query_test(string query, QTYPE qt, unsigned ttl) {
+    struct __res_state resstate;
     int ret = 0;
     u_char buf[NS_PACKETSZ] = {0};
-    vector<unique_ptr<ResourceRecord>> records;
+    vector<unique_ptr<ResourceRecord>> records; 
+    vector<RRNode> root;
 
-    memset(u, 0, sizeof(u));
-    memset(&res, 0, sizeof(struct __res_state));
-
-    if ((ret = res_ninit(&res)) < 0) {
+    memset(&resstate, 0, sizeof(struct __res_state));
+    if ((ret = res_ninit(&resstate)) < 0) {
         STDERR(hstrerror(ret));
         throw exception();
     }
-    res.nscount = 0;
 
     #ifdef DEBUG
-    res.options |= RES_DEBUG;
+    resstate.options |= RES_DEBUG; // FIXME: not working under Linux????
     #endif
-    u[0].sin.sin_addr = query->in;
-    u[0].sin.sin_family = AF_INET;  // TODO: IPv6 support
-    u[0].sin.sin_port = htons(53);
-
-    res_setservers((res_state) &res, u, 1);
     
-    if ((ret = res_nquery(&res, 
-                query->dname.c_str(), 
-                ns_c_in, query->qtype, 
+    if ((ret = res_nquery(&resstate, 
+                query.c_str(), 
+                ns_c_in,
+                qt, 
                 buf, 
                 sizeof(buf))) > 0) {    // FIXME: not a desired behaviour (e.g. SOA)
-        // TODO:
-        // parser(response) -> ResourceRecord
-        // return make_unique<ResourceRecord>(rr)
-
-        // OLD
-        records = dns2str(query->qtype, buf, ret);
-    }
-    res_ndestroy(&res);
-    vector<future<void>> responses;
-
+        records = dns2str(qt, buf, ret);
+    } 
+    #ifdef DEBUG
+    else 
+        STDERR(hstrerror(h_errno) << ", " << qt << " " << query << " " << ttl);
+    #endif
+    vector<future<vector<RRNode>>> responses;
     while (!records.empty()) {
         root.push_back(RRNode { move(records.back()) });
         records.pop_back();
     }
-
-/*     transform(make_move_iterator(records.begin()), make_move_iterator(records.end()), back_inserter(root),
-                    [] (ResourceRecord &r) -> RRNode { return RRNode { make_unique<ResourceRecord>(r) }; }); // FIXME: move clause neccessary?
- */
-    for (auto &rrnode : root) {
-        for (auto qtype : rrnode.record->asQueryTo()) {
-            auto new_q = rrnode.record->asQuery();
-            new_q->qtype = qtype;
-            responses.push_back(async(launch::async, [&]() { return query_test(move(new_q), rrnode.children); }));
+    if (ttl > 0) {
+        for (auto &rrnode : root) {
+            for (auto qtype : rrnode.record->asQueryTo()) {
+                auto new_q = rrnode.record->asQuery();
+                if (new_q.empty()) {
+                    #ifdef DEBUG
+                    STDERR("WARNING: " << to_string(rrnode.record->qtype()) << " is empty!");
+                    #endif
+                    break;
+                }
+                //auto result = query_test(move(new_q), qtype);
+                responses.push_back(async(launch::async, 
+                    [ttl, qtype, s = move(new_q)](){ return query_test(s, qtype, ttl - 1); }));
+            }
         }
     }
-    for (auto &response : responses) {
-        response.get();
+    size_t idx_max = (responses.size() > root.size() ? root.size() : responses.size());
+    for (size_t i = 0; i < idx_max; ++i) {
+        auto res_val = responses[i].get();
+        root[i].children.reserve(res_val.size());
+        root[i].children.insert(root[i].children.end(), 
+            make_move_iterator(res_val.begin()), 
+            make_move_iterator(res_val.end()));
     }
+    res_nclose(&resstate);
+    return root;
 }
 
-static
+/* static
 string query(const char *name, ns_type type, struct in_addr dns) {
     struct __res_state res;
-    res_9_sockaddr_union u[1];
     int ret = 0;
     u_char buf[NS_PACKETSZ] = {0};
     string record;
 
-    memset(u, 0, sizeof(u));
     memset(&res, 0, sizeof(struct __res_state));
 
     if ((ret = res_ninit(&res)) < 0) {
@@ -493,58 +476,65 @@ string query(const char *name, ns_type type, struct in_addr dns) {
     res.options |= RES_DEBUG;
     #endif
 
+    #ifdef __APPLE__
+    res_9_sockaddr_union u[1];
+    memset(u, 0, sizeof(u));
     u[0].sin.sin_addr = dns;
     u[0].sin.sin_family = AF_INET;  // TODO: IPv6 support
     u[0].sin.sin_port = htons(53);
-
     res_setservers((res_state) &res, u, 1);
-    
+    #else
+    // TODO: write your own impl of set_server
+    // use externet set_servers
+    #endif
+
     if ((ret = res_nquery(&res, name, ns_c_in, type, buf, sizeof(buf))) > 0) {
         //record.append(dns2str(type, buf, ret));
     }
-
+    #ifdef __APPLE__
     res_ndestroy(&res);
+    #else
+    res_nclose(&res);
+    #endif
+
     return record;
-}
-
-
+} */
 
 int main(int argc, const char *argv[]) {
 
     STDOUT("Trying " << argv[1] << "...\n");
-    //vector<future<string>> queries;
-    vector<future<void>> responses;
-
-    vector<RRNode> t_aaaa_a;
-    vector<RRNode> t_a_a;
-    vector<RRNode> t_mx_a;
-    vector<RRNode> t_soa_a;
+    vector<future<vector<RRNode>>> responses;
+    vector<RRNode> results;
+    unsigned ttl = 3; // the level of recursion
 
     try {
         struct in_addr in;
         if (inet_pton(AF_INET, argv[2], &in) != 1) {
             exit(EXIT_FAILURE);
         }
-        unique_ptr<DNSQuery> t_aaaa(new DNSQuery(argv[1], QTYPE::aaaa, AF_INET, in));
-        unique_ptr<DNSQuery> t_a(new DNSQuery(argv[1], QTYPE::a, AF_INET, in));
-        unique_ptr<DNSQuery> t_mx(new DNSQuery(argv[1], QTYPE::mx, AF_INET, in));
-        unique_ptr<DNSQuery> t_soa(new DNSQuery(argv[1], QTYPE::soa, AF_INET, in));
+        // TODO: PTR if dname is IP
+        string t_aaaa(argv[1]);
+        string t_a(argv[1]); 
+        string t_mx(argv[1]);
+        string t_soa(argv[1]);
 
-       /*  queries.push_back(async(launch::async, [&]() { return query(argv[1], ns_t_aaaa, in); }));
-        queries.push_back(async(launch::async, [&]() { return query(argv[1], ns_t_a, in); }));
-        queries.push_back(async(launch::async, [&]() { return query(argv[1], ns_t_soa, in); }));
-        queries.push_back(async(launch::async, [&]() { return query(argv[1], ns_t_mx, in); }));
-        queries.push_back(async(launch::async, [&]() { return query(argv[1], ns_t_ptr, in); }));
- */
-        responses.push_back(async(launch::async, [&]() { return query_test(move(t_aaaa), t_aaaa_a); }));   // AAAA(s)
-        responses.push_back(async(launch::async, [&]() { return query_test(move(t_a), t_a_a); }));   // AAAA(s)
-        responses.push_back(async(launch::async, [&]() { return query_test(move(t_mx), t_mx_a); }));   // AAAA(s)
-        responses.push_back(async(launch::async, [&]() { return query_test(move(t_soa), t_soa_a); }));   // AAAA(s)
-        // ...
+        responses.push_back(async(launch::async, [ttl, s = move(t_aaaa)]() { return query_test(s, QTYPE::aaaa, ttl); }));   // AAAA(s)
+        responses.push_back(async(launch::async, [ttl, s = move(t_a)]() { return query_test(s,QTYPE::a, ttl); }));   // AAAA(s)
+        responses.push_back(async(launch::async, [ttl, s = move(t_mx)]() { return query_test(s, QTYPE::mx, ttl); }));   // AAAA(s)
+        responses.push_back(async(launch::async, [ttl, s = move(t_soa)]() { return query_test(s, QTYPE::soa, ttl); }));   // AAAA(s)
 
+        // TODO: refactor
+        for (auto &r : responses) {
+            auto res_value = r.get();
+            results.insert(results.end(),
+                make_move_iterator(res_value.begin()),
+                make_move_iterator(res_value.end()));
+        }
 
         STDOUT("========= DNS =========\n");
 
+        for (auto &result : results)
+            result.printTree();
     }
     catch(...) {
          exit(EXIT_FAILURE);
@@ -554,6 +544,4 @@ int main(int argc, const char *argv[]) {
     return EXIT_SUCCESS;
 }
 
-
 //  TODO: debug __LINE__ msgs
-// TODO: data tree ontainer
