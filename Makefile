@@ -10,7 +10,7 @@ isa-tazatel: isa-tazatel.cpp
 	$(CPP) -o $@ $@.cpp $(CPPFLAGS) -O2 -lresolv -pthread
 
 debug: isa-tazatel.cpp
-	$(CPP) -o isa-tazatel $^ $(CPPFLAGS) -g -DDEBUG -lresolv -pthread
+	$(CPP) -o isa-tazatel $^ $(CPPFLAGS) -g -ggdb3 -DDEBUG -lresolv -pthread
 
 clean:
 	rm isa-tazatel

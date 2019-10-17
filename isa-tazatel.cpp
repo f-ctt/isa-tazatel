@@ -41,6 +41,7 @@ class ResourceRecord {
         virtual string asQuery() = 0;
         virtual unsigned qtype() const = 0;
         virtual vector<QTYPE> asQueryTo() = 0;
+        virtual ~ResourceRecord() {};
 };
 
 struct RRNode {
@@ -65,6 +66,7 @@ class MX : public ResourceRecord {
         string toString() { return string(to_string(pref).append(" ") + exch); }
         unsigned qtype() const { return QTYPE::mx; }
         vector<QTYPE> asQueryTo() { return vector<QTYPE>(); }
+        ~MX(){ }
 };
 
 class PTR : public ResourceRecord {
@@ -83,7 +85,8 @@ class PTR : public ResourceRecord {
                     QTYPE::soa
                 }; 
         }
-        string toString() { return string(name); };
+        string toString() { return name; };
+        ~PTR() {};
 };
 
 class SOA : public ResourceRecord {
@@ -102,6 +105,7 @@ class SOA : public ResourceRecord {
         string toString() {
             return string(mname.append(" ").append(rname));
         }
+        ~SOA(){};
 };
 
 class A : public ResourceRecord {
@@ -127,6 +131,7 @@ class A : public ResourceRecord {
             addr = tmp;
             return dname.append(".in-addr.arpa");
         }
+        ~A(){};
 };
 
 class AAAA : public ResourceRecord {
@@ -155,50 +160,94 @@ class AAAA : public ResourceRecord {
             addr = tmp;
             return dname.append(".ip6.arpa"); 
         }
+        ~AAAA(){};
 };
 
-/* class NSParser {
-    private:
-        vector<u_char> rdata;
-        __ns_sect section;
-        ns_msg handle;
-        int msg_count;
-    public:
-        NSParser(const u_char *rdata, int size, __ns_sect section) : rdata(rdata, rdata + size), section(section) {
-            int ret = 0;
-            if ((ret = ns_initparse(this->rdata.data(), size, &handle)) < 0)
-                throw runtime_error(hstrerror(ret));
-            msg_count = ns_msg_count(handle, section);
-        }
-
-        vector<ResourceRecord> parse(DNSResponse response) {
-            ns_rr rr;
-            int ret = 0;
-            vector<ResourceRecord> rrecords;
-
-            for (int i = 0; i < msg_count; ++i) {
-                if ((ret = ns_parserr(&handle, section, rdata.size(), &rr)) < 0)
-                    throw runtime_error(hstrerror(ret));
-                for (auto c : response.components) {
-                    switch(c) {
-                        case RRComponent::DomainName:
-                            break;
-                        case RRComponent::IPv4:
-                            break;
-                        case RRComponent::IPv6:
-                            break;
-                        case RRComponent::u16:
-                            break;
-                        case RRComponent::u32:
-                            break;
-                        default:
-                            throw runtime_error(string("NSParser::parse wrong component num: ") + 
-                                to_string(c));
-                    }
+static
+vector<unique_ptr<ResourceRecord>> 
+parsedns_test(const u_char *rdata, int size, __ns_sect section, unsigned tarqtype) {
+    char dname[NS_MAXDNAME] = {0};
+    int ret = 0;
+    ns_msg handle;
+    ns_rr rr;
+    u_char *cp = NULL;
+    unsigned actual_qtype = 0;
+    int msg_count = 0;
+    vector<unique_ptr<ResourceRecord>> records;
+    if ((ret = ns_initparse(rdata, size, &handle)) < 0)
+        throw runtime_error(hstrerror(ret));
+    msg_count = ns_msg_count(handle, ns_s_an);
+    for (int i = 0; i < msg_count; ++i) {
+        if ((ret = ns_parserr(&handle, section, i, &rr)) < 0)
+            throw runtime_error(hstrerror(ret));
+        if ((actual_qtype = ns_rr_type(rr)) != tarqtype)
+            return records; // FIXME: TODO: figure out what to do next
+        cp = (u_char *)ns_rr_rdata(rr);
+        switch(actual_qtype) {
+            case ns_t_a: {
+                struct in_addr addr;
+                memcpy(&addr, cp, sizeof(addr));
+                records.push_back(make_unique<A>(A(addr)));
+            } break;
+            case ns_t_aaaa: {
+                struct in6_addr addr6in;
+                memcpy(&addr6in, cp, sizeof(addr6in));
+                records.push_back(make_unique<AAAA>(AAAA(addr6in)));
+            } break;
+            case ns_t_soa: {
+                if ((ret = ns_name_uncompress(ns_msg_base(handle), 
+                                    ns_msg_end(handle), 
+                                    cp, 
+                                    dname, 
+                                    sizeof(dname))) < 0) {
+                        STDERR(hstrerror(ret));
+                        throw runtime_error("Soa parsing failed");
                 }
-            }
+                string mname(dname);
+                cp += ret;
+                if ((ret = ns_name_uncompress(ns_msg_base(handle), 
+                    ns_msg_end(handle), 
+                    cp, 
+                    dname, 
+                    sizeof(dname))) < 0) {
+                        STDERR(hstrerror(ret));
+                        throw runtime_error("Soa parsing failed");
+                }
+                string rname(dname);
+                records.push_back(make_unique<SOA>(SOA(mname, rname)));
+            } break;
+            case ns_t_mx: {
+                uint16_t pref = ns_get16(cp);
+                cp += 2;
+                if ((ret = ns_name_uncompress(ns_msg_base(handle), 
+                    ns_msg_end(handle), 
+                    cp, 
+                    dname, 
+                    sizeof(dname))) < 0) {
+                        STDERR(hstrerror(ret));
+                        throw runtime_error("MX parsing failed");
+                }
+                records.push_back(make_unique<MX>(MX(pref, dname)));
+            } break;
+            case ns_t_ptr: 
+                if ((ret = ns_name_uncompress(
+                            ns_msg_base(handle), 
+                            ns_msg_end(handle), 
+                            cp, 
+                            dname, 
+                            sizeof(dname))) < 0) {
+                                STDERR(hstrerror(ret));
+                                throw runtime_error("PTR parsing failed");
+                        }
+                records.push_back(make_unique<PTR>(PTR(dname)));
+                break;
+            default:
+                throw runtime_error("qtype not handled");
+                break;
         }
-}; */
+    }
+    return records;
+}
 
 __attribute__((always_inline))
 void init_resparser(const u_char *buffer, int size, ns_msg &handle, u_char **cp, ns_rr &rr, int &msg_count) {
@@ -421,7 +470,8 @@ vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
                 qt, 
                 buf, 
                 sizeof(buf))) > 0) {    // FIXME: not a desired behaviour (e.g. SOA)
-        records = dns2str(qt, buf, ret);
+        //records = dns2str(qt, buf, ret); // FIXME: NOTE: we assume the right answer
+        records = parsedns_test(buf, ret, ns_s_an, qt); // FIXME: NOTE: we assume the right answer
     } 
     #ifdef DEBUG
     else 
@@ -447,14 +497,6 @@ vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
             }
         }
     }
-    /* size_t idx_max = (responses.size() > root.size() ? root.size() : responses.size());
-    for (size_t i = 0; i < idx_max; ++i) {
-        auto res_val = responses[i].get();
-        root[i].children.insert(root[i].children.end(), 
-            make_move_iterator(res_val.begin()), 
-            make_move_iterator(res_val.end()));
-    }
- */    
     size_t tar_idx = 0;
     for (auto &node : root) {
         for (size_t i = 0; i < node.record->asQueryTo().size() && tar_idx < responses.size(); ++i) {
@@ -465,13 +507,6 @@ vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
         }
     }
     res_nclose(&resstate);
-    #ifdef DEBUG
-        STDOUT_MX.lock();
-        for (auto &node : root) {
-            cout << "Inside root: " << node.record->toString() << endl;
-        }
-        STDOUT_MX.unlock();
-    #endif
     return root;
 }
 
@@ -480,7 +515,7 @@ int main(int, const char *argv[]) {
     STDOUT("Trying " << argv[1] << "...\n");
     vector<future<vector<RRNode>>> responses;
     vector<RRNode> results;
-    unsigned ttl = 2; // the level of recursion
+    unsigned ttl = 3; // the level of recursion
 
     struct in6_addr host_in6;
     struct in_addr host_in;
