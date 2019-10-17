@@ -46,9 +46,11 @@ class ResourceRecord {
 struct RRNode {
     unique_ptr<ResourceRecord> record; 
     vector<struct RRNode> children;
-    void printTree() {
+    void printTree(unsigned depth = 0) {
         for (auto &child : children)
-            child.printTree();
+            child.printTree(depth + 1);
+        while (depth-- > 0)
+            cout << "\t\t";
         cout << record->toString() << endl;
     }
 };
@@ -395,11 +397,12 @@ vector<unique_ptr<ResourceRecord>> dns2str(unsigned type, const u_char *buffer, 
 
 
 static
-vector<RRNode> query_test(string query, QTYPE qt, unsigned ttl) {
+vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
     struct __res_state resstate;
     int ret = 0;
     u_char buf[NS_PACKETSZ] = {0};
     vector<unique_ptr<ResourceRecord>> records; 
+    vector<future<vector<RRNode>>> responses;
     vector<RRNode> root;
 
     memset(&resstate, 0, sizeof(struct __res_state));
@@ -413,7 +416,7 @@ vector<RRNode> query_test(string query, QTYPE qt, unsigned ttl) {
     #endif
     
     if ((ret = res_nquery(&resstate, 
-                query.c_str(), 
+                hname.c_str(), 
                 ns_c_in,
                 qt, 
                 buf, 
@@ -422,11 +425,11 @@ vector<RRNode> query_test(string query, QTYPE qt, unsigned ttl) {
     } 
     #ifdef DEBUG
     else 
-        STDERR(hstrerror(h_errno) << ", " << qt << " " << query << " " << ttl);
+        STDERR(hstrerror(h_errno) << ", " << qt << " " << hname << " " << ttl);
     #endif
-    vector<future<vector<RRNode>>> responses;
     while (!records.empty()) {
         root.push_back(RRNode { move(records.back()) });
+        
         records.pop_back();
     }
     if (ttl > 0) {
@@ -434,95 +437,83 @@ vector<RRNode> query_test(string query, QTYPE qt, unsigned ttl) {
             for (auto qtype : rrnode.record->asQueryTo()) {
                 auto new_q = rrnode.record->asQuery();
                 if (new_q.empty()) {
-                    #ifdef DEBUG
+                    #ifdef DEBUG // FIXME: throw an exception. This may not happen
                     STDERR("WARNING: " << to_string(rrnode.record->qtype()) << " is empty!");
                     #endif
                     break;
                 }
-                //auto result = query_test(move(new_q), qtype);
                 responses.push_back(async(launch::async, 
-                    [ttl, qtype, s = move(new_q)](){ return query_test(s, qtype, ttl - 1); }));
+                    [ttl, qtype, s = move(new_q)](){ return query(s, qtype, ttl - 1); }));
             }
         }
     }
-    size_t idx_max = (responses.size() > root.size() ? root.size() : responses.size());
+    /* size_t idx_max = (responses.size() > root.size() ? root.size() : responses.size());
     for (size_t i = 0; i < idx_max; ++i) {
         auto res_val = responses[i].get();
-        root[i].children.reserve(res_val.size());
         root[i].children.insert(root[i].children.end(), 
             make_move_iterator(res_val.begin()), 
             make_move_iterator(res_val.end()));
     }
+ */    
+    size_t tar_idx = 0;
+    for (auto &node : root) {
+        for (size_t i = 0; i < node.record->asQueryTo().size() && tar_idx < responses.size(); ++i) {
+            auto res_val = responses[tar_idx++].get(); // NOTE: ++
+            node.children.insert(node.children.end(),
+            make_move_iterator(res_val.begin()),
+            make_move_iterator(res_val.end()));
+        }
+    }
     res_nclose(&resstate);
+    #ifdef DEBUG
+        STDOUT_MX.lock();
+        for (auto &node : root) {
+            cout << "Inside root: " << node.record->toString() << endl;
+        }
+        STDOUT_MX.unlock();
+    #endif
     return root;
 }
 
-/* static
-string query(const char *name, ns_type type, struct in_addr dns) {
-    struct __res_state res;
-    int ret = 0;
-    u_char buf[NS_PACKETSZ] = {0};
-    string record;
-
-    memset(&res, 0, sizeof(struct __res_state));
-
-    if ((ret = res_ninit(&res)) < 0) {
-        STDERR(hstrerror(ret));
-        throw exception();
-    }
-    res.nscount = 0;
-
-    #ifdef DEBUG
-    res.options |= RES_DEBUG;
-    #endif
-
-    #ifdef __APPLE__
-    res_9_sockaddr_union u[1];
-    memset(u, 0, sizeof(u));
-    u[0].sin.sin_addr = dns;
-    u[0].sin.sin_family = AF_INET;  // TODO: IPv6 support
-    u[0].sin.sin_port = htons(53);
-    res_setservers((res_state) &res, u, 1);
-    #else
-    // TODO: write your own impl of set_server
-    // use externet set_servers
-    #endif
-
-    if ((ret = res_nquery(&res, name, ns_c_in, type, buf, sizeof(buf))) > 0) {
-        //record.append(dns2str(type, buf, ret));
-    }
-    #ifdef __APPLE__
-    res_ndestroy(&res);
-    #else
-    res_nclose(&res);
-    #endif
-
-    return record;
-} */
-
-int main(int argc, const char *argv[]) {
+int main(int, const char *argv[]) {
 
     STDOUT("Trying " << argv[1] << "...\n");
     vector<future<vector<RRNode>>> responses;
     vector<RRNode> results;
-    unsigned ttl = 3; // the level of recursion
+    unsigned ttl = 2; // the level of recursion
 
+    struct in6_addr host_in6;
+    struct in_addr host_in;
+
+    int is_host_in6 = inet_pton(AF_INET6, argv[1], &host_in6);
+    int is_host_in = inet_pton(AF_INET, argv[1], &host_in);
+
+    // TODO: support for cusotm DNS
+    /* struct in_addr in;
+    if (inet_pton(AF_INET, argv[2], &in) != 1) {
+        exit(EXIT_FAILURE);
+    }
+ */
     try {
-        struct in_addr in;
-        if (inet_pton(AF_INET, argv[2], &in) != 1) {
-            exit(EXIT_FAILURE);
+        if (is_host_in == 1) {  
+            A ahost = A(host_in);
+            auto arpa = ahost.asQuery();
+            responses.push_back(async(launch::async, [ttl, s = move(arpa)]() { return query(s, QTYPE::ptr, ttl); }));   // AAAA(s)
+        } else if (is_host_in6 == 1) {
+            AAAA ahost = AAAA(host_in6);
+            auto arpa = ahost.asQuery();
+            responses.push_back(async(launch::async, [ttl, s = move(arpa)]() { return query(s, QTYPE::ptr, ttl); }));   // AAAA(s)
+        } else {
+            string t_aaaa(argv[1]);
+            string t_a(argv[1]); 
+            string t_mx(argv[1]);
+            string t_soa(argv[1]);
+
+            responses.push_back(async(launch::async, [ttl, s = move(t_aaaa)]() { return query(s, QTYPE::aaaa, ttl); }));   // AAAA(s)
+            responses.push_back(async(launch::async, [ttl, s = move(t_a)]() { return query(s,QTYPE::a, ttl); }));   // AAAA(s)
+            responses.push_back(async(launch::async, [ttl, s = move(t_mx)]() { return query(s, QTYPE::mx, ttl); }));   // AAAA(s)
+            responses.push_back(async(launch::async, [ttl, s = move(t_soa)]() { return query(s, QTYPE::soa, ttl); }));   // AAAA(s)
         }
-        // TODO: PTR if dname is IP
-        string t_aaaa(argv[1]);
-        string t_a(argv[1]); 
-        string t_mx(argv[1]);
-        string t_soa(argv[1]);
-
-        responses.push_back(async(launch::async, [ttl, s = move(t_aaaa)]() { return query_test(s, QTYPE::aaaa, ttl); }));   // AAAA(s)
-        responses.push_back(async(launch::async, [ttl, s = move(t_a)]() { return query_test(s,QTYPE::a, ttl); }));   // AAAA(s)
-        responses.push_back(async(launch::async, [ttl, s = move(t_mx)]() { return query_test(s, QTYPE::mx, ttl); }));   // AAAA(s)
-        responses.push_back(async(launch::async, [ttl, s = move(t_soa)]() { return query_test(s, QTYPE::soa, ttl); }));   // AAAA(s)
-
         // TODO: refactor
         for (auto &r : responses) {
             auto res_value = r.get();
