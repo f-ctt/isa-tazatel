@@ -9,12 +9,11 @@
 #include <thread>
 #include <future>
 #include <vector>
-#include <tuple>
 #include <cstring>
-#include <unordered_map>
 #include <functional>
 #include <unistd.h>
 #include <mutex>
+#include <getopt.h>
 
 using namespace std;
 
@@ -121,7 +120,7 @@ class A : public ResourceRecord {
         string toString() {
             char buf[INET_ADDRSTRLEN] = {0};
             if (inet_ntop(AF_INET, &addr, buf, sizeof(buf)) == NULL)
-                throw runtime_error("inet_ntop zhorel a nemel");
+                throw runtime_error("inet_ntop zhorel a nemel v A");
             return string(buf);
         }
         string asQuery() {
@@ -147,18 +146,34 @@ class AAAA : public ResourceRecord {
         string toString() {
             char buf[INET6_ADDRSTRLEN] = {0};
             if (inet_ntop(AF_INET6, &addr, buf, sizeof(buf)) == NULL)
-                throw runtime_error("inet_ntop zhorel a nemel");
+                throw runtime_error("inet_ntop zhorel v AAAA");
             return string(buf);
         }
-
+        // e.g. "8.8.8.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa"
+        // source: nslookup.c
+        // FIXME: not really a protable code due to the inner members of 'addr'
         string asQuery() {
-            struct in6_addr tmp = addr;
-            for (auto &v : tmp.__in6_u.__u6_addr16) { //FIXME: I highly doubt this is fine
-                v = htons(v);
+            char resbuf[80];
+            const unsigned char v4_mapped[12] = { 0,0,0,0, 0,0,0,0, 0,0, 0xff, 0xff };
+            if (memcmp(addr.__in6_u.__u6_addr8, v4_mapped, 12) != 0) {
+                char hexdigits_upcase[] = "0123456789ABCDEF";
+                int i;
+                char *ptr = resbuf;
+                for (i = 0; i < 16; i++) {
+                    *ptr++ = 0x20 | hexdigits_upcase[(unsigned char)addr.__in6_u.__u6_addr8[15 - i] & 0xf];
+                    *ptr++ = '.';
+                    *ptr++ = 0x20 | hexdigits_upcase[(unsigned char)addr.__in6_u.__u6_addr8[15 - i] >> 4];
+                    *ptr++ = '.';
+                }
+                strcpy(ptr, "ip6.arpa");
+                return string(resbuf);
             }
-            string dname = this->toString();
-            addr = tmp;
-            return dname.append(".ip6.arpa"); 
+            snprintf(resbuf, sizeof(resbuf), "%u.%u.%u.%u.in-addr.arpa",
+                    addr.__in6_u.__u6_addr8[15], 
+                    addr.__in6_u.__u6_addr8[14], 
+                    addr.__in6_u.__u6_addr8[13], 
+                    addr.__in6_u.__u6_addr8[12]);
+            return string(resbuf);
         }
         ~AAAA(){};
 };
@@ -248,6 +263,49 @@ parsedns_test(const u_char *rdata, int size, __ns_sect section, unsigned tarqtyp
     }
     return records;
 }
+static
+void res_ndestroy(res_state state) {
+    res_nclose(state);
+    for (int i = 0; i < 3; ++i) {
+        if (state->_u._ext.nsaddrs[i] != NULL) {
+            free(state->_u._ext.nsaddrs[i]);
+            state->_u._ext.nsaddrs[i] = NULL;
+        }
+    }
+    state->options &= ~RES_INIT;
+}
+
+static
+int res_setserver(res_state state, int af, const char *ip) {
+    if (af == AF_INET) {
+        in_addr in;
+        if (inet_pton(af, ip, &in) != 1) {
+            return -1;
+        }
+        state->nsaddr_list[0].sin_family = af;
+        state->nsaddr_list[0].sin_port = htons(53);
+        state->nsaddr_list[0].sin_addr = in;
+        state->_u._ext.nsaddrs[0] = NULL;
+
+    } else if (af == AF_INET6) {
+        in6_addr in;
+        if (inet_pton(af, ip, &in) != 1) {
+            return -1;
+        }
+        state->nsaddr_list[0].sin_family = 0;
+        sockaddr_in6 *sin6 = (sockaddr_in6 *) malloc(sizeof(sockaddr_in6));
+        memset(sin6, 0, sizeof(sockaddr_in));
+        sin6->sin6_scope_id = 0;
+        sin6->sin6_addr = in;
+        sin6->sin6_family = AF_INET6;
+        sin6->sin6_port = htons(53);
+        state->_u._ext.nsaddrs[0] = sin6;
+    } else {
+        return -1;
+    }
+    state->nscount = 1;
+    return 0;
+}
 
 static
 vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
@@ -264,8 +322,12 @@ vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
         throw exception();
     }
 
-    #ifdef DEBUG
-    resstate.options |= RES_DEBUG; // FIXME: not working under Linux????
+    if (res_setserver(&resstate, AF_INET6, "2001:4860:4860::8888"))
+        throw runtime_error("Setting DNS server failed");
+    #if defined(DEBUG) && defined(__APPLE__)
+    // NOTE: It doesn't work in glibc (https://github.com/bminor/glibc/blob/master/resolv/README#L21) 
+    // it only work if glibc was build with debug option
+    resstate.options |= RES_DEBUG; 
     #endif
     
     if ((ret = res_nquery(&resstate, 
@@ -310,7 +372,8 @@ vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
             make_move_iterator(res_val.end()));
         }
     }
-    res_nclose(&resstate);
+    res_ndestroy(&resstate);
+    // res_nclose(&resstate); // Docs says I should not call this directly but then I may just screw freeing the mem completely
     return root;
 }
 
@@ -332,7 +395,7 @@ int main(int, const char *argv[]) {
     if (inet_pton(AF_INET, argv[2], &in) != 1) {
         exit(EXIT_FAILURE);
     }
- */
+ */ 
     try {
         if (is_host_in == 1) {  
             A ahost = A(host_in);
@@ -343,15 +406,10 @@ int main(int, const char *argv[]) {
             auto arpa = ahost.asQuery();
             responses.push_back(async(launch::async, [ttl, s = move(arpa)]() { return query(s, QTYPE::ptr, ttl); }));   // AAAA(s)
         } else {
-            string t_aaaa(argv[1]);
-            string t_a(argv[1]); 
-            string t_mx(argv[1]);
-            string t_soa(argv[1]);
-
-            responses.push_back(async(launch::async, [ttl, s = move(t_aaaa)]() { return query(s, QTYPE::aaaa, ttl); }));   // AAAA(s)
-            responses.push_back(async(launch::async, [ttl, s = move(t_a)]() { return query(s,QTYPE::a, ttl); }));   // AAAA(s)
-            responses.push_back(async(launch::async, [ttl, s = move(t_mx)]() { return query(s, QTYPE::mx, ttl); }));   // AAAA(s)
-            responses.push_back(async(launch::async, [ttl, s = move(t_soa)]() { return query(s, QTYPE::soa, ttl); }));   // AAAA(s)
+            responses.push_back(async(launch::async, [ttl, argv]() { return query(argv[1], QTYPE::aaaa, ttl); }));   // AAAA(s)
+            responses.push_back(async(launch::async, [ttl, argv]() { return query(argv[1], QTYPE::a, ttl); }));   // AAAA(s)
+            responses.push_back(async(launch::async, [ttl, argv]() { return query(argv[1], QTYPE::mx, ttl); }));   // AAAA(s)
+            responses.push_back(async(launch::async, [ttl, argv]() { return query(argv[1], QTYPE::soa, ttl); }));   // AAAA(s)
         }
         // TODO: refactor
         for (auto &r : responses) {
@@ -366,8 +424,9 @@ int main(int, const char *argv[]) {
         for (auto &result : results)
             result.printTree();
     }
-    catch(...) {
-         exit(EXIT_FAILURE);
+    catch(const char *msg) {
+        STDERR(msg);
+        exit(EXIT_FAILURE);
     }
 
 
