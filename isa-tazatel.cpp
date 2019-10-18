@@ -20,8 +20,13 @@ using namespace std;
 static mutex STDOUT_MX;
 static mutex STDERR_MX;
 
+
 #define STDERR(x) do { STDERR_MX.lock();cerr << __func__ << ":" <<__LINE__ << ": " << x << endl; STDERR_MX.unlock(); } while (0)
 #define STDOUT(x) do { STDOUT_MX.lock(); cout << x << endl; STDOUT_MX.unlock(); } while (0)
+
+static struct in6_addr DNS_IN6;
+static struct in_addr DNS_IN;
+static int TAR_AFINET_DNS = 0;
 
 enum QTYPE {
     a = 1,      // An A record for the domain name
@@ -276,27 +281,19 @@ void res_ndestroy(res_state state) {
 }
 
 static
-int res_setserver(res_state state, int af, const char *ip) {
+int res_setserver(res_state state, int af) {
     if (af == AF_INET) {
-        in_addr in;
-        if (inet_pton(af, ip, &in) != 1) {
-            return -1;
-        }
         state->nsaddr_list[0].sin_family = af;
         state->nsaddr_list[0].sin_port = htons(53);
-        state->nsaddr_list[0].sin_addr = in;
+        state->nsaddr_list[0].sin_addr = DNS_IN;
         state->_u._ext.nsaddrs[0] = NULL;
 
     } else if (af == AF_INET6) {
-        in6_addr in;
-        if (inet_pton(af, ip, &in) != 1) {
-            return -1;
-        }
         state->nsaddr_list[0].sin_family = 0;
         sockaddr_in6 *sin6 = (sockaddr_in6 *) malloc(sizeof(sockaddr_in6));
         memset(sin6, 0, sizeof(sockaddr_in));
         sin6->sin6_scope_id = 0;
-        sin6->sin6_addr = in;
+        sin6->sin6_addr = DNS_IN6;
         sin6->sin6_family = AF_INET6;
         sin6->sin6_port = htons(53);
         state->_u._ext.nsaddrs[0] = sin6;
@@ -322,8 +319,10 @@ vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
         throw exception();
     }
 
-    if (res_setserver(&resstate, AF_INET6, "2001:4860:4860::8888"))
-        throw runtime_error("Setting DNS server failed");
+    if (TAR_AFINET_DNS) {
+        if (res_setserver(&resstate, TAR_AFINET_DNS))
+            throw runtime_error("Setting DNS server failed");
+    }
     #if defined(DEBUG) && defined(__APPLE__)
     // NOTE: It doesn't work in glibc (https://github.com/bminor/glibc/blob/master/resolv/README#L21) 
     // it only work if glibc was build with debug option
@@ -377,25 +376,72 @@ vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
     return root;
 }
 
-int main(int, const char *argv[]) {
+static
+void print_help() {
+    cout << "No help yet.." << endl;
+}
 
-    STDOUT("Trying " << argv[1] << "...\n");
+static
+void check_argv(int argc, char *const *argv, char **q, char **w, char **d) {
+    const char* const short_opts = "q:w:d:h";
+        const option long_opts[] = {
+                {"query", required_argument, nullptr, 'q'},
+                {"whois", required_argument, nullptr, 'w'},
+                {"dns", required_argument, nullptr, 'd'},
+                {"help", no_argument, nullptr, 'h'},
+                {nullptr, no_argument, nullptr, 0}
+        };
+    
+    while (true) { 
+        const auto opt = getopt_long(argc, argv, short_opts, long_opts, nullptr);
+        if (opt == -1)
+            break;
+        switch (opt) { 
+            case 'q':   *q = optarg; break; 
+            case 'w':   *w = optarg; break;
+            case 'd':   *d = optarg; break;
+            case 'h':   print_help(); exit(EXIT_SUCCESS);
+            case '?':   print_help(); exit(EXIT_FAILURE);
+            default:    print_help(); exit(EXIT_FAILURE);
+        }
+    }
+    // TODO: check whois once implemented
+    if (*q == NULL) {
+        print_help();
+        exit(EXIT_FAILURE);
+    }
+}
+
+static
+void dns_pton(char *dnsip) {
+    if (inet_pton(AF_INET, dnsip, &DNS_IN) != 1) {
+        if (inet_pton(AF_INET6, dnsip, &DNS_IN6) != 1) {
+            print_help();
+            exit(EXIT_FAILURE);
+        }
+        TAR_AFINET_DNS = AF_INET6;
+        return;
+    } 
+    TAR_AFINET_DNS = AF_INET;
+}
+
+int main(int argc, char *const *argv) {
     vector<future<vector<RRNode>>> responses;
     vector<RRNode> results;
     unsigned ttl = 3; // the level of recursion
+    char *q = NULL, *w = NULL, *d = NULL;
+
+    check_argv(argc, argv, &q, &w, &d);
 
     struct in6_addr host_in6;
     struct in_addr host_in;
 
-    int is_host_in6 = inet_pton(AF_INET6, argv[1], &host_in6);
-    int is_host_in = inet_pton(AF_INET, argv[1], &host_in);
+    int is_host_in6 = inet_pton(AF_INET6, q, &host_in6);
+    int is_host_in = inet_pton(AF_INET, q, &host_in);
 
-    // TODO: support for cusotm DNS
-    /* struct in_addr in;
-    if (inet_pton(AF_INET, argv[2], &in) != 1) {
-        exit(EXIT_FAILURE);
-    }
- */ 
+    if (d != NULL)
+      dns_pton(d); 
+
     try {
         if (is_host_in == 1) {  
             A ahost = A(host_in);
@@ -406,10 +452,10 @@ int main(int, const char *argv[]) {
             auto arpa = ahost.asQuery();
             responses.push_back(async(launch::async, [ttl, s = move(arpa)]() { return query(s, QTYPE::ptr, ttl); }));   // AAAA(s)
         } else {
-            responses.push_back(async(launch::async, [ttl, argv]() { return query(argv[1], QTYPE::aaaa, ttl); }));   // AAAA(s)
-            responses.push_back(async(launch::async, [ttl, argv]() { return query(argv[1], QTYPE::a, ttl); }));   // AAAA(s)
-            responses.push_back(async(launch::async, [ttl, argv]() { return query(argv[1], QTYPE::mx, ttl); }));   // AAAA(s)
-            responses.push_back(async(launch::async, [ttl, argv]() { return query(argv[1], QTYPE::soa, ttl); }));   // AAAA(s)
+            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::aaaa, ttl); }));   // AAAA(s)
+            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::a, ttl); }));   // AAAA(s)
+            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::mx, ttl); }));   // AAAA(s)
+            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::soa, ttl); }));   // AAAA(s)
         }
         // TODO: refactor
         for (auto &r : responses) {
