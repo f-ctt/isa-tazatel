@@ -24,20 +24,20 @@ static mutex STDERR_MX;
 #define STDERR(x) do { STDERR_MX.lock();cerr << __func__ << ":" <<__LINE__ << ": " << x << endl; STDERR_MX.unlock(); } while (0)
 #define STDOUT(x) do { STDOUT_MX.lock(); cout << x << endl; STDOUT_MX.unlock(); } while (0)
 
+static struct sockaddr_in WHOST;
 static struct in6_addr DNS_IN6;
 static struct in_addr DNS_IN;
 static int TAR_AFINET_DNS = 0;
 
 enum QTYPE {
     a = 1,      // An A record for the domain name
-    ns = 2, 	// A NS record( for the domain name
-    cname = 5, 	// A CNAME record for the domain name
+    //ns = 2, 	// A NS record( for the domain name
+    //cname = 5, 	// A CNAME record for the domain name
     soa = 6, 	// A SOA record for the domain name
     ptr = 12, 	// A PTR record(s) for the domain name
     mx = 15, 	// A MX record for the domain name
     aaaa = 28 	// An AAAA record(s) for the domain name
 };
-
 
 class ResourceRecord {
     public:
@@ -122,6 +122,8 @@ class A : public ResourceRecord {
 
         unsigned qtype() const { return QTYPE::a; } 
 
+        struct in_addr inaddr() { return addr; }
+
         string toString() {
             char buf[INET_ADDRSTRLEN] = {0};
             if (inet_ntop(AF_INET, &addr, buf, sizeof(buf)) == NULL)
@@ -148,6 +150,8 @@ class AAAA : public ResourceRecord {
 
         unsigned qtype() const { return QTYPE::aaaa; }
 
+        struct in6_addr in6addr() { return addr; }
+
         string toString() {
             char buf[INET6_ADDRSTRLEN] = {0};
             if (inet_ntop(AF_INET6, &addr, buf, sizeof(buf)) == NULL)
@@ -158,7 +162,7 @@ class AAAA : public ResourceRecord {
         // source: nslookup.c
         // FIXME: not really a protable code due to the inner members of 'addr'
         string asQuery() {
-            char resbuf[80];
+            char resbuf[80]= {0};
             const unsigned char v4_mapped[12] = { 0,0,0,0, 0,0,0,0, 0,0, 0xff, 0xff };
             if (memcmp(addr.__in6_u.__u6_addr8, v4_mapped, 12) != 0) {
                 char hexdigits_upcase[] = "0123456789ABCDEF";
@@ -201,7 +205,7 @@ parsedns_test(const u_char *rdata, int size, __ns_sect section, unsigned tarqtyp
         if ((ret = ns_parserr(&handle, section, i, &rr)) < 0)
             throw runtime_error(hstrerror(ret));
         if ((actual_qtype = ns_rr_type(rr)) != tarqtype)
-            return records; // FIXME: TODO: figure out what to do next
+            continue; // FIXME: TODO: figure out what to do next
         cp = (u_char *)ns_rr_rdata(rr);
         switch(actual_qtype) {
             case ns_t_a: {
@@ -304,6 +308,42 @@ int res_setserver(res_state state, int af) {
     return 0;
 }
 
+/**
+ * @brief Sends whois query('ip') to whois server('addr') and saves the answer in 'response'
+ * 
+ * @param in whois server addr
+ * @param ip The addr of the host
+ * @param af AF_INET/AF_INET6
+ * @param buf buffer for a response
+ * @return int 0 if success, other on failure
+ */
+static
+int whois_nquery(const char *ip, int af, vector<u_char> &response) {
+    int sock, rsize = sock = 0;
+    u_char buf[1500]; // ethernet's datagram size
+
+    if ((sock = socket(af, SOCK_STREAM, IPPROTO_TCP)) == -1) {
+        return errno;
+    }
+
+	if (connect(sock , (sockaddr *)&WHOST, sizeof(WHOST)))
+        return errno;
+    
+    string wquery = string() + ip + "\r\n";
+	if (send(sock, wquery.c_str(), wquery.size(), 0) < 0)
+        return errno;
+
+	while ((rsize = recv(sock, buf, sizeof(buf), 0)) > 0) { 
+        response.insert(response.end(), buf, buf + rsize);
+	}
+    if (rsize < 0) {
+        return errno;
+    }
+
+	close(sock);
+	return 0;
+}
+
 static
 vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
     struct __res_state resstate;
@@ -325,7 +365,7 @@ vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
     }
     #if defined(DEBUG) && defined(__APPLE__)
     // NOTE: It doesn't work in glibc (https://github.com/bminor/glibc/blob/master/resolv/README#L21) 
-    // it only work if glibc was build with debug option
+    // it only works if glibc was build with debug option
     resstate.options |= RES_DEBUG; 
     #endif
     
@@ -335,8 +375,7 @@ vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
                 qt, 
                 buf, 
                 sizeof(buf))) > 0) {    // FIXME: not a desired behaviour (e.g. SOA)
-        //records = dns2str(qt, buf, ret); // FIXME: NOTE: we assume the right answer
-        records = parsedns_test(buf, ret, ns_s_an, qt); // FIXME: NOTE: we assume the right answer
+        records = parsedns_test(buf, ret, ns_s_an, qt);
     } 
     #ifdef DEBUG
     else 
@@ -344,19 +383,14 @@ vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
     #endif
     while (!records.empty()) {
         root.push_back(RRNode { move(records.back()) });
-        
         records.pop_back();
     }
     if (ttl > 0) {
         for (auto &rrnode : root) {
             for (auto qtype : rrnode.record->asQueryTo()) {
                 auto new_q = rrnode.record->asQuery();
-                if (new_q.empty()) {
-                    #ifdef DEBUG // FIXME: throw an exception. This may not happen
-                    STDERR("WARNING: " << to_string(rrnode.record->qtype()) << " is empty!");
-                    #endif
-                    break;
-                }
+                if (new_q.empty())
+                    throw runtime_error(to_string(qtype) + " as query() returns empty string"); 
                 responses.push_back(async(launch::async, 
                     [ttl, qtype, s = move(new_q)](){ return query(s, qtype, ttl - 1); }));
             }
@@ -372,7 +406,6 @@ vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
         }
     }
     res_ndestroy(&resstate);
-    // res_nclose(&resstate); // Docs says I should not call this directly but then I may just screw freeing the mem completely
     return root;
 }
 
@@ -391,7 +424,6 @@ void check_argv(int argc, char *const *argv, char **q, char **w, char **d) {
                 {"help", no_argument, nullptr, 'h'},
                 {nullptr, no_argument, nullptr, 0}
         };
-    
     while (true) { 
         const auto opt = getopt_long(argc, argv, short_opts, long_opts, nullptr);
         if (opt == -1)
@@ -405,11 +437,31 @@ void check_argv(int argc, char *const *argv, char **q, char **w, char **d) {
             default:    print_help(); exit(EXIT_FAILURE);
         }
     }
-    // TODO: check whois once implemented
-    if (*q == NULL) {
+    if (*q == NULL || *w == NULL) {
         print_help();
         exit(EXIT_FAILURE);
     }
+}
+
+static
+void set_whost(const char *whost) {
+    auto response = query(whost, QTYPE::a, 0); // assume user issued a hostname first
+    if (response.empty()) {
+        response = query(whost, QTYPE::ptr, 0);
+        if (response.empty()) {
+            STDERR("Cannot obtain hostname of " << whost);
+            exit(EXIT_FAILURE);
+        }
+        response = query(response.back().record->toString(), QTYPE::a, 0);
+        if (response.empty())
+            exit(EXIT_FAILURE);
+    }
+    sockaddr_in whin;
+    memset(&whin, 0, sizeof(whin));
+    whin.sin_addr = dynamic_cast<A*>(response.back().record.get())->inaddr(); // ^_^
+    whin.sin_family = AF_INET;
+    whin.sin_port = htons(43);
+    WHOST = whin;
 }
 
 static
@@ -442,20 +494,31 @@ int main(int argc, char *const *argv) {
     if (d != NULL)
       dns_pton(d); 
 
-    try {
+    try { set_whost(w); } catch(const char *msg) { STDERR(msg); }
+
+    int ret = 0;
+    vector<u_char> wreply;
+    if ((ret = whois_nquery(q, AF_INET, wreply)))
+        STDERR(strerror(ret));
+    else
+        for (auto ch : wreply)
+            cout << ch;
+    /* try {
         if (is_host_in == 1) {  
             A ahost = A(host_in);
             auto arpa = ahost.asQuery();
-            responses.push_back(async(launch::async, [ttl, s = move(arpa)]() { return query(s, QTYPE::ptr, ttl); }));   // AAAA(s)
+            responses.push_back(async(launch::async, [ttl, s = move(arpa)]() { return query(s, QTYPE::ptr, ttl); }));
+            // TODO: WHOIS query
         } else if (is_host_in6 == 1) {
             AAAA ahost = AAAA(host_in6);
             auto arpa = ahost.asQuery();
-            responses.push_back(async(launch::async, [ttl, s = move(arpa)]() { return query(s, QTYPE::ptr, ttl); }));   // AAAA(s)
+            responses.push_back(async(launch::async, [ttl, s = move(arpa)]() { return query(s, QTYPE::ptr, ttl); }));
+            // TODO: WHOIS query
         } else {
-            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::aaaa, ttl); }));   // AAAA(s)
-            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::a, ttl); }));   // AAAA(s)
-            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::mx, ttl); }));   // AAAA(s)
-            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::soa, ttl); }));   // AAAA(s)
+            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::aaaa, ttl); }));
+            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::a, ttl); })); 
+            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::mx, ttl); })); 
+            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::soa, ttl); }));
         }
         // TODO: refactor
         for (auto &r : responses) {
@@ -474,7 +537,7 @@ int main(int argc, char *const *argv) {
         STDERR(msg);
         exit(EXIT_FAILURE);
     }
-
+ */
 
     return EXIT_SUCCESS;
 }
