@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <mutex>
 #include <getopt.h>
+#include <sstream>
 
 using namespace std;
 
@@ -58,6 +59,33 @@ struct RRNode {
             cout << "\t\t";
         cout << record->toString() << endl;
     }
+};
+
+class Query {
+    //virtual ~Query() = 0;
+    //virtual vector<ResourceRecord> send() = 0;
+};
+
+class DNSQuery : Query {
+
+};
+
+class WhoisQuery : Query {
+
+};
+
+// FIXME: TODO: this is wrongly named as whois answers maay contain DNS resource records
+// also qtype doesn't fit here
+// basically a bullshit abstraction
+class Whois : public ResourceRecord {
+    private:
+        string answer;
+    public:
+        Whois(string answer) : answer(answer) {}
+        string toString() { return answer; }
+        string asQuery()  { return string(); }
+        vector<QTYPE> asQueryTo() { return vector<QTYPE>(); }
+        unsigned qtype() const { return 0; }
 };
 
 class MX : public ResourceRecord {
@@ -308,40 +336,65 @@ int res_setserver(res_state state, int af) {
     return 0;
 }
 
+__attribute__((__always_inline__))
+static
+void erase_all(string &str, const string &chars = "\n\r\n \\") {
+    for (auto ch: chars)
+        str.erase(std::remove(str.begin(), str.end(), ch), str.end());
+}
+
 /**
  * @brief Sends whois query('ip') to whois server('addr') and saves the answer in 'response'
  * 
  * @param in whois server addr
  * @param ip The addr of the host
  * @param af AF_INET/AF_INET6
- * @param buf buffer for a response
- * @return int 0 if success, other on failure
+ * @param buf buffer for a response. If a return value equals to -2, this buffer 
+ *          contains hostname of the next whost that the former points to
+ * @return int 0 if success, -1 on failure, -2 if the current whost points to 
+ *          another whost - redireciton
  */
 static
-int whois_nquery(const char *ip, int af, vector<u_char> &response) {
-    int sock, rsize = sock = 0;
-    u_char buf[1500]; // ethernet's datagram size
+int whois_nquery(const char *ip, int af, string &response) {
+    int ret, sock, rsize = sock = ret = 0;
+    char buf[1500] = {0}; // ethernet's datagram size
 
-    if ((sock = socket(af, SOCK_STREAM, IPPROTO_TCP)) == -1) {
-        return errno;
+    if ((sock = socket(af, SOCK_STREAM, IPPROTO_TCP)) == -1) { // socket sets errno
+        return -1;
     }
-
-	if (connect(sock , (sockaddr *)&WHOST, sizeof(WHOST)))
-        return errno;
+	if (connect(sock , (sockaddr *)&WHOST, sizeof(WHOST))) {// connect sets errno
+        return -1;
+    }
     
     string wquery = string() + ip + "\r\n";
-	if (send(sock, wquery.c_str(), wquery.size(), 0) < 0)
-        return errno;
-
-	while ((rsize = recv(sock, buf, sizeof(buf), 0)) > 0) { 
+	if (send(sock, wquery.c_str(), wquery.size(), 0) < 0) // sets errno as well
+        return -1;
+    while ((rsize = recv(sock, buf, sizeof(buf), 0)) > 0) {
+        size_t pos = string::npos;
+        istringstream stream(buf);
+        for (string line; getline(stream, line); ) {
+            transform(line.begin(), line.end(), line.begin(),
+                [](unsigned char c){ return tolower(c); });
+            if ((pos = line.find("whois:")) != string::npos) {
+                erase_all(line);
+                response = line.substr(pos + strlen("whois:"), line.size());
+                close(sock);
+                return -2;
+            }
+            else if ((pos = line.find("whois server:")) != string::npos) {
+                erase_all(line);
+                response = line.substr(pos + strlen("whois server:"), line.size());
+                close(sock);
+                return -2;
+            } 
+        }
         response.insert(response.end(), buf, buf + rsize);
-	}
-    if (rsize < 0) {
-        return errno;
     }
-
+    if (rsize < 0) {
+        ret = -1;
+    }
 	close(sock);
-	return 0;
+	return ret;
 }
 
 static
@@ -354,10 +407,8 @@ vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
     vector<RRNode> root;
 
     memset(&resstate, 0, sizeof(struct __res_state));
-    if ((ret = res_ninit(&resstate)) < 0) {
-        STDERR(hstrerror(ret));
-        throw exception();
-    }
+    if ((ret = res_ninit(&resstate)) < 0)
+        throw runtime_error(hstrerror(ret));
 
     if (TAR_AFINET_DNS) {
         if (res_setserver(&resstate, TAR_AFINET_DNS))
@@ -445,27 +496,35 @@ void check_argv(int argc, char *const *argv, char **q, char **w, char **d) {
 
 static
 void set_whost(const char *whost) {
-    auto response = query(whost, QTYPE::a, 0); // assume user issued a hostname first
-    if (response.empty()) {
-        response = query(whost, QTYPE::ptr, 0);
-        if (response.empty()) {
-            STDERR("Cannot obtain hostname of " << whost);
-            exit(EXIT_FAILURE);
-        }
-        response = query(response.back().record->toString(), QTYPE::a, 0);
-        if (response.empty())
-            exit(EXIT_FAILURE);
-    }
     sockaddr_in whin;
     memset(&whin, 0, sizeof(whin));
-    whin.sin_addr = dynamic_cast<A*>(response.back().record.get())->inaddr(); // ^_^
+    #ifdef DEBUG
+    STDOUT("Setting up whost..." << \
+        "\nAssuming whost format: hostname");
+    #endif
+    auto response = query(whost, QTYPE::a, 0); // assume user issued a hostname first
+    if (response.empty()) {
+        #ifdef DEBUG
+        STDOUT("Fetching IP of " << whost << " failed.\
+            \nAssuming whost format: IP. Trying to fetch hostname.");
+        #endif
+        response = query(whost, QTYPE::ptr, 0);
+        if (response.empty())
+            throw runtime_error("Couldn't reach " + string(whost));
+        if (inet_pton(AF_INET, whost, &whin.sin_addr.s_addr) != 1)
+            throw runtime_error("Inetrnal error");
+    } else {
+        // FIXME: assumption response.back() can be problematic in the future because of different
+        // types of 1:N answer
+        whin.sin_addr = dynamic_cast<A*>(response.back().record.get())->inaddr(); // ^_^
+    }
     whin.sin_family = AF_INET;
     whin.sin_port = htons(43);
     WHOST = whin;
 }
-
+// TODO: REFACTOR: use one buffer for both addresses
 static
-void dns_pton(char *dnsip) {
+void set_dns(char *dnsip) {
     if (inet_pton(AF_INET, dnsip, &DNS_IN) != 1) {
         if (inet_pton(AF_INET6, dnsip, &DNS_IN6) != 1) {
             print_help();
@@ -480,7 +539,9 @@ void dns_pton(char *dnsip) {
 int main(int argc, char *const *argv) {
     vector<future<vector<RRNode>>> responses;
     vector<RRNode> results;
-    unsigned ttl = 3; // the level of recursion
+    string whois_ans;
+    unsigned ttl = 1; // the level of recursion
+    int ret = 0;
     char *q = NULL, *w = NULL, *d = NULL;
 
     check_argv(argc, argv, &q, &w, &d);
@@ -492,28 +553,28 @@ int main(int argc, char *const *argv) {
     int is_host_in = inet_pton(AF_INET, q, &host_in);
 
     if (d != NULL)
-      dns_pton(d); 
+      set_dns(d);
 
-    try { set_whost(w); } catch(const char *msg) { STDERR(msg); }
-
-    int ret = 0;
-    vector<u_char> wreply;
-    if ((ret = whois_nquery(q, AF_INET, wreply)))
-        STDERR(strerror(ret));
-    else
-        for (auto ch : wreply)
-            cout << ch;
-    /* try {
+    try {
+        set_whost(w);
         if (is_host_in == 1) {  
             A ahost = A(host_in);
             auto arpa = ahost.asQuery();
             responses.push_back(async(launch::async, [ttl, s = move(arpa)]() { return query(s, QTYPE::ptr, ttl); }));
-            // TODO: WHOIS query
+            auto str = ahost.toString();
+            while ((ret = whois_nquery(str.c_str(), AF_INET, whois_ans)) == -2) {
+                #ifdef DEBUG
+                STDOUT("[Redirecting to " << whois_ans << "] ...");
+                #endif
+                set_whost(whois_ans.c_str());
+            }
+            if (ret == -1)
+                throw runtime_error(string() + "whois query failed: " + strerror(ret));
         } else if (is_host_in6 == 1) {
             AAAA ahost = AAAA(host_in6);
             auto arpa = ahost.asQuery();
             responses.push_back(async(launch::async, [ttl, s = move(arpa)]() { return query(s, QTYPE::ptr, ttl); }));
-            // TODO: WHOIS query
+            // TODO: whois support for IPv6
         } else {
             responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::aaaa, ttl); }));
             responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::a, ttl); })); 
@@ -528,16 +589,19 @@ int main(int argc, char *const *argv) {
                 make_move_iterator(res_value.end()));
         }
 
-        STDOUT("========= DNS =========\n");
+        cout << "\n========= DNS =========\n\n";
 
         for (auto &result : results)
             result.printTree();
+
+        cout <<"\n========= WHOIS =========\n\n";
+        cout << whois_ans << endl;
     }
-    catch(const char *msg) {
-        STDERR(msg);
+    catch(const runtime_error &error) {
+        STDERR(error.what());
         exit(EXIT_FAILURE);
     }
- */
+
 
     return EXIT_SUCCESS;
 }
