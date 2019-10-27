@@ -25,75 +25,73 @@ static mutex STDERR_MX;
 #define STDERR(x) do { STDERR_MX.lock();cerr << __func__ << ":" <<__LINE__ << ": " << x << endl; STDERR_MX.unlock(); } while (0)
 #define STDOUT(x) do { STDOUT_MX.lock(); cout << x << endl; STDOUT_MX.unlock(); } while (0)
 
-static struct sockaddr_in WHOST;
 static struct in6_addr DNS_IN6;
 static struct in_addr DNS_IN;
 static int TAR_AFINET_DNS = 0;
 
 enum QTYPE {
     a = 1,      // An A record for the domain name
-    //ns = 2, 	// A NS record( for the domain name
-    //cname = 5, 	// A CNAME record for the domain name
+    ns = 2, 	// A NS record( for the domain name
+    cname = 5, 	// A CNAME record for the domain name
     soa = 6, 	// A SOA record for the domain name
     ptr = 12, 	// A PTR record(s) for the domain name
     mx = 15, 	// A MX record for the domain name
     aaaa = 28 	// An AAAA record(s) for the domain name
 };
 
-class ResourceRecord {
+class Record {
     public:
+        virtual const char *descr() const = 0;
         virtual string toString() = 0;
         virtual string asQuery() = 0;
         virtual unsigned qtype() const = 0;
         virtual vector<QTYPE> asQueryTo() = 0;
-        virtual ~ResourceRecord() {};
+        virtual ~Record() {};
 };
 
-struct RRNode {
-    unique_ptr<ResourceRecord> record; 
-    vector<struct RRNode> children;
-    void printTree(unsigned depth = 0) {
-        for (auto &child : children)
-            child.printTree(depth + 1);
-        while (depth-- > 0)
-            cout << "\t\t";
+using RecordPtr = unique_ptr<Record>;
+using Records = vector<RecordPtr>;
+
+struct RecordNode {
+    RecordPtr record; 
+    vector<struct RecordNode> children;
+    void printTree(const string &prefix, bool last) {
+        cout << prefix << (last ? "└──" : "├──");
+        auto desc = record->descr();
+        cout << desc;
+        for (int i = 0; i < 6 - strlen(desc); ++i)
+            cout << "─";
         cout << record->toString() << endl;
+        unsigned cnt = 0;
+        for (auto &ch : children) {
+            cnt++;
+            bool lst = (cnt == children.size());
+            ch.printTree(prefix + (last ? "         " : "|         "), lst);
+        }
     }
 };
 
-class Query {
-    //virtual ~Query() = 0;
-    //virtual vector<ResourceRecord> send() = 0;
-};
+using RecordNodes = vector<RecordNode>;
 
-class DNSQuery : Query {
-
-};
-
-class WhoisQuery : Query {
-
-};
-
-// FIXME: TODO: this is wrongly named as whois answers maay contain DNS resource records
-// also qtype doesn't fit here
-// basically a bullshit abstraction
-class Whois : public ResourceRecord {
+class Whois : public Record {
     private:
         string answer;
     public:
         Whois(string answer) : answer(answer) {}
+        const char *descr() const { return "WHOIS"; }
         string toString() { return answer; }
         string asQuery()  { return string(); }
         vector<QTYPE> asQueryTo() { return vector<QTYPE>(); }
         unsigned qtype() const { return 0; }
 };
 
-class MX : public ResourceRecord {
+class MX : public Record {
     private:
         uint16_t pref;
         string exch;
     public:
         MX(uint16_t pref, string exch) : pref(pref), exch(exch) {}
+        const char *descr() const { return "MX"; }
         string asQuery() { return string(); }
         string toString() { return string(to_string(pref).append(" ") + exch); }
         unsigned qtype() const { return QTYPE::mx; }
@@ -101,11 +99,24 @@ class MX : public ResourceRecord {
         ~MX(){ }
 };
 
-class PTR : public ResourceRecord {
+class CNAME: public Record {
+    private:
+        string cname;
+    public:
+        CNAME(string cname) : cname(cname) {}
+        const char *descr() const { return "CNAME"; }
+        string asQuery() { return cname; }
+        unsigned qtype() const { return QTYPE::cname; }
+        vector<QTYPE> asQueryTo() { return vector<QTYPE>(); } // TODO: unimplemented
+        string toString() { return cname; }
+};
+
+class PTR : public Record {
     private:
         string name;
     public:
         PTR(string name) : name(name) {}
+        const char *descr() const { return "PTR"; }
         string asQuery() { return this->toString(); } 
         unsigned qtype() const { return QTYPE::ptr; }
         vector<QTYPE> asQueryTo() { 
@@ -118,16 +129,15 @@ class PTR : public ResourceRecord {
                 }; 
         }
         string toString() { return name; };
-        ~PTR() {};
 };
 
-class SOA : public ResourceRecord {
+class SOA : public Record {
     private:
         string mname;
         string rname;
     public:
         SOA(string mname, string rname) : mname(mname), rname(rname) {}
-
+        const char *descr() const { return "SOA"; }
         vector<QTYPE> asQueryTo() { return vector<QTYPE>(); }
 
         unsigned qtype() const { return QTYPE::soa; }
@@ -140,7 +150,7 @@ class SOA : public ResourceRecord {
         ~SOA(){};
 };
 
-class A : public ResourceRecord {
+class A : public Record {
     private:
         struct in_addr addr;
     public:
@@ -148,6 +158,7 @@ class A : public ResourceRecord {
 
         vector<QTYPE> asQueryTo() { return vector<QTYPE>{ QTYPE::ptr }; }
 
+        const char *descr() const { return "A"; }
         unsigned qtype() const { return QTYPE::a; } 
 
         struct in_addr inaddr() { return addr; }
@@ -165,14 +176,26 @@ class A : public ResourceRecord {
             addr = tmp;
             return dname.append(".in-addr.arpa");
         }
-        ~A(){};
 };
 
-class AAAA : public ResourceRecord {
+class NS: public Record {
+        private:
+            string name;
+        public:
+            NS(string name) : name(name) {}
+            vector<QTYPE> asQueryTo() { return vector<QTYPE>(); } // TODO: unimplemented
+            unsigned qtype() const { return QTYPE::ns; }
+            string toString() { return name; }
+            string asQuery() { return name; }
+            const char *descr() const { return "NS"; }
+};
+
+class AAAA : public Record {
     private:
         struct in6_addr addr;
     public:
         AAAA(struct in6_addr addr) : addr(addr) {}
+        const char *descr() const { return "AAAA"; }
 
         vector<QTYPE> asQueryTo() { return vector<QTYPE>{ QTYPE::ptr }; }
 
@@ -212,12 +235,11 @@ class AAAA : public ResourceRecord {
                     addr.__in6_u.__u6_addr8[12]);
             return string(resbuf);
         }
-        ~AAAA(){};
 };
 
 static
-vector<unique_ptr<ResourceRecord>> 
-parsedns_test(const u_char *rdata, int size, __ns_sect section, unsigned tarqtype) {
+vector<unique_ptr<Record>> 
+parsedns(const u_char *rdata, int size, __ns_sect section, unsigned tarqtype) {
     char dname[NS_MAXDNAME] = {0};
     int ret = 0;
     ns_msg handle;
@@ -225,7 +247,7 @@ parsedns_test(const u_char *rdata, int size, __ns_sect section, unsigned tarqtyp
     u_char *cp = NULL;
     unsigned actual_qtype = 0;
     int msg_count = 0;
-    vector<unique_ptr<ResourceRecord>> records;
+    vector<unique_ptr<Record>> records;
     if ((ret = ns_initparse(rdata, size, &handle)) < 0)
         throw runtime_error(hstrerror(ret));
     msg_count = ns_msg_count(handle, ns_s_an);
@@ -233,13 +255,35 @@ parsedns_test(const u_char *rdata, int size, __ns_sect section, unsigned tarqtyp
         if ((ret = ns_parserr(&handle, section, i, &rr)) < 0)
             throw runtime_error(hstrerror(ret));
         if ((actual_qtype = ns_rr_type(rr)) != tarqtype)
-            continue; // FIXME: TODO: figure out what to do next
+            continue; // NOTE: skipping an answer we didn't ask for
         cp = (u_char *)ns_rr_rdata(rr);
         switch(actual_qtype) {
             case ns_t_a: {
                 struct in_addr addr;
                 memcpy(&addr, cp, sizeof(addr));
                 records.push_back(make_unique<A>(A(addr)));
+            } break;
+            case ns_t_ns: {
+                if ((ret = ns_name_uncompress(ns_msg_base(handle), 
+                            ns_msg_end(handle), 
+                            cp, 
+                            dname, 
+                            sizeof(dname))) < 0) {
+                    STDERR(hstrerror(ret));
+                    throw runtime_error("NS parsing failed");
+                }
+                records.push_back(make_unique<NS>(NS(dname)));
+            }break;
+            case ns_t_cname: {
+                if ((ret = ns_name_uncompress(ns_msg_base(handle), 
+                            ns_msg_end(handle), 
+                            cp, 
+                            dname, 
+                            sizeof(dname))) < 0) {
+                    STDERR(hstrerror(ret));
+                    throw runtime_error("CNAME parsing failed");
+                }
+                records.push_back(make_unique<CNAME>(CNAME(dname)));
             } break;
             case ns_t_aaaa: {
                 struct in6_addr addr6in;
@@ -248,12 +292,12 @@ parsedns_test(const u_char *rdata, int size, __ns_sect section, unsigned tarqtyp
             } break;
             case ns_t_soa: {
                 if ((ret = ns_name_uncompress(ns_msg_base(handle), 
-                                    ns_msg_end(handle), 
-                                    cp, 
-                                    dname, 
-                                    sizeof(dname))) < 0) {
-                        STDERR(hstrerror(ret));
-                        throw runtime_error("Soa parsing failed");
+                            ns_msg_end(handle), 
+                            cp, 
+                            dname, 
+                            sizeof(dname))) < 0) {
+                    STDERR(hstrerror(ret));
+                    throw runtime_error("SOA parsing failed");
                 }
                 string mname(dname);
                 cp += ret;
@@ -294,7 +338,9 @@ parsedns_test(const u_char *rdata, int size, __ns_sect section, unsigned tarqtyp
                 records.push_back(make_unique<PTR>(PTR(dname)));
                 break;
             default:
-                throw runtime_error("qtype not handled");
+                #ifdef DEBUG
+                    STDERR("WARNING: Qtype not handled: " << actual_qtype);
+                #endif
                 break;
         }
     }
@@ -343,68 +389,14 @@ void erase_all(string &str, const string &chars = "\n\r\n \\") {
         str.erase(std::remove(str.begin(), str.end(), ch), str.end());
 }
 
-/**
- * @brief Sends whois query('ip') to whois server('addr') and saves the answer in 'response'
- * 
- * @param in whois server addr
- * @param ip The addr of the host
- * @param af AF_INET/AF_INET6
- * @param buf buffer for a response. If a return value equals to -2, this buffer 
- *          contains hostname of the next whost that the former points to
- * @return int 0 if success, -1 on failure, -2 if the current whost points to 
- *          another whost - redireciton
- */
 static
-int whois_nquery(const char *ip, int af, string &response) {
-    int ret, sock, rsize = sock = ret = 0;
-    char buf[1500] = {0}; // ethernet's datagram size
-
-    if ((sock = socket(af, SOCK_STREAM, IPPROTO_TCP)) == -1) { // socket sets errno
-        return -1;
-    }
-	if (connect(sock , (sockaddr *)&WHOST, sizeof(WHOST))) {// connect sets errno
-        return -1;
-    }
-    
-    string wquery = string() + ip + "\r\n";
-	if (send(sock, wquery.c_str(), wquery.size(), 0) < 0) // sets errno as well
-        return -1;
-    while ((rsize = recv(sock, buf, sizeof(buf), 0)) > 0) {
-        size_t pos = string::npos;
-        istringstream stream(buf);
-        for (string line; getline(stream, line); ) {
-            transform(line.begin(), line.end(), line.begin(),
-                [](unsigned char c){ return tolower(c); });
-            if ((pos = line.find("whois:")) != string::npos) {
-                erase_all(line);
-                response = line.substr(pos + strlen("whois:"), line.size());
-                close(sock);
-                return -2;
-            }
-            else if ((pos = line.find("whois server:")) != string::npos) {
-                erase_all(line);
-                response = line.substr(pos + strlen("whois server:"), line.size());
-                close(sock);
-                return -2;
-            } 
-        }
-        response.insert(response.end(), buf, buf + rsize);
-    }
-    if (rsize < 0) {
-        ret = -1;
-    }
-	close(sock);
-	return ret;
-}
-
-static
-vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
+vector<RecordNode> query(string hname, QTYPE qt, unsigned ttl) {
     struct __res_state resstate;
     int ret = 0;
     u_char buf[NS_PACKETSZ] = {0};
-    vector<unique_ptr<ResourceRecord>> records; 
-    vector<future<vector<RRNode>>> responses;
-    vector<RRNode> root;
+    vector<unique_ptr<Record>> records; 
+    vector<future<vector<RecordNode>>> responses;
+    vector<RecordNode> root;
 
     memset(&resstate, 0, sizeof(struct __res_state));
     if ((ret = res_ninit(&resstate)) < 0)
@@ -426,14 +418,14 @@ vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
                 qt, 
                 buf, 
                 sizeof(buf))) > 0) {    // FIXME: not a desired behaviour (e.g. SOA)
-        records = parsedns_test(buf, ret, ns_s_an, qt);
+        records = parsedns(buf, ret, ns_s_an, qt);
     } 
     #ifdef DEBUG
     else 
         STDERR(hstrerror(h_errno) << ", " << qt << " " << hname << " " << ttl);
     #endif
     while (!records.empty()) {
-        root.push_back(RRNode { move(records.back()) });
+        root.push_back(RecordNode { move(records.back()) });
         records.pop_back();
     }
     if (ttl > 0) {
@@ -461,19 +453,104 @@ vector<RRNode> query(string hname, QTYPE qt, unsigned ttl) {
 }
 
 static
+int set_whost(string whost, sockaddr_storage *in, bool redirection = false) {
+    if (!redirection) {
+        if (inet_pton(AF_INET, whost.c_str(), &((struct sockaddr_in *)in)->sin_addr) != 1) {
+            if (inet_pton(AF_INET6, whost.c_str(), &((struct sockaddr_in6 *)in)->sin6_addr) == 1) {
+                ((sockaddr_in6 *)in)->sin6_port = htons(43);
+                in->ss_family = AF_INET6;
+                return AF_INET6;
+            }
+        } else {
+            ((sockaddr_in *)in)->sin_port = htons(43);
+            in->ss_family = AF_INET;
+            return AF_INET;
+        }
+    }
+    auto response = query(whost, QTYPE::a, 0);
+    for (auto &res : response) {
+        if (res.record->qtype() == QTYPE::a) {
+            sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_addr = dynamic_cast<A*>(res.record.get())->inaddr();
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(43);
+            memcpy(in, &addr, sizeof(sockaddr_in));
+            return AF_INET;
+        }
+    }
+    return -1;
+}
+
+static
+string whois_nquery(string ip, string whost) {
+    int ret, sock, rsize, insize = rsize = sock = ret = 0;
+    char buf[1500] = {0}; // ethernet's datagram size
+    bool redirection = false;
+    string response;
+    sockaddr_storage in;
+    ip.append("\r\n");
+
+    do {
+        response.clear();
+        redirection = false;
+        memset(&in, 0, sizeof(in));
+        if ((ret = set_whost(whost, &in, false)) < 0)
+            throw runtime_error(string() + "whost: " + hstrerror(h_errno));
+        insize = (ret == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6));
+        if ((sock = socket(ret, SOCK_STREAM, IPPROTO_TCP)) == -1) {
+            throw runtime_error(strerror(errno));
+        }
+        if (connect(sock , (sockaddr *)&in, insize)) {
+            throw runtime_error(string() + "whost: " + strerror(errno));
+        }
+        if (send(sock, ip.c_str(), ip.size(), 0) < 0)
+            throw runtime_error(strerror(errno));
+        while ((rsize = recv(sock, buf, sizeof(buf), 0)) > 0) {
+            size_t pos = string::npos;
+            istringstream stream;
+            stream.str(buf);
+            for (string line; getline(stream, line); ) {
+                transform(line.begin(), line.end(), line.begin(),
+                    [](unsigned char c){ return tolower(c); });
+                if ((pos = line.find("whois:")) != string::npos) {
+                    erase_all(line);
+                    whost = line.substr(pos + strlen("whois:"), line.size());
+                    redirection = true;
+                }
+                else if ((pos = line.find("whois server:")) != string::npos) {
+                    erase_all(line);
+                    whost = line.substr(pos + strlen("whois server:"), line.size());
+                    redirection = true;
+                } 
+            }
+            response.insert(response.end(), buf, buf + rsize);
+        }
+        if (rsize < 0) {
+            throw runtime_error(strerror(errno));
+        }
+        close(sock);
+    } while (redirection);
+    return response;
+}
+
+static
 void print_help() {
-    cout << "No help yet.." << endl;
+    cout << \
+        "\t-q <IP|hostname> Query\n" << \
+        "\t-w <IP|hostname> WHOIS server>\n" << \
+        "\t-d <IP> DNS server. Optional argument. By default, system configured DNS is used\n";
 }
 
 static
 void check_argv(int argc, char *const *argv, char **q, char **w, char **d) {
     const char* const short_opts = "q:w:d:h";
         const option long_opts[] = {
-                {"query", required_argument, nullptr, 'q'},
-                {"whois", required_argument, nullptr, 'w'},
-                {"dns", required_argument, nullptr, 'd'},
-                {"help", no_argument, nullptr, 'h'},
-                {nullptr, no_argument, nullptr, 0}
+            {"query", required_argument, nullptr, 'q'},
+            {"whois", required_argument, nullptr, 'w'},
+            {"dns", required_argument, nullptr, 'd'},
+            {"help", no_argument, nullptr, 'h'},
+            {nullptr, no_argument, nullptr, 0}
         };
     while (true) { 
         const auto opt = getopt_long(argc, argv, short_opts, long_opts, nullptr);
@@ -494,34 +571,6 @@ void check_argv(int argc, char *const *argv, char **q, char **w, char **d) {
     }
 }
 
-static
-void set_whost(const char *whost) {
-    sockaddr_in whin;
-    memset(&whin, 0, sizeof(whin));
-    #ifdef DEBUG
-    STDOUT("Setting up whost..." << \
-        "\nAssuming whost format: hostname");
-    #endif
-    auto response = query(whost, QTYPE::a, 0); // assume user issued a hostname first
-    if (response.empty()) {
-        #ifdef DEBUG
-        STDOUT("Fetching IP of " << whost << " failed.\
-            \nAssuming whost format: IP. Trying to fetch hostname.");
-        #endif
-        response = query(whost, QTYPE::ptr, 0);
-        if (response.empty())
-            throw runtime_error("Couldn't reach " + string(whost));
-        if (inet_pton(AF_INET, whost, &whin.sin_addr.s_addr) != 1)
-            throw runtime_error("Inetrnal error");
-    } else {
-        // FIXME: assumption response.back() can be problematic in the future because of different
-        // types of 1:N answer
-        whin.sin_addr = dynamic_cast<A*>(response.back().record.get())->inaddr(); // ^_^
-    }
-    whin.sin_family = AF_INET;
-    whin.sin_port = htons(43);
-    WHOST = whin;
-}
 // TODO: REFACTOR: use one buffer for both addresses
 static
 void set_dns(char *dnsip) {
@@ -537,49 +586,38 @@ void set_dns(char *dnsip) {
 }
 
 int main(int argc, char *const *argv) {
-    vector<future<vector<RRNode>>> responses;
-    vector<RRNode> results;
+    vector<future<vector<RecordNode>>> responses;
+    vector<RecordNode> results;
     string whois_ans;
-    unsigned ttl = 1; // the level of recursion
-    int ret = 0;
+    sockaddr_storage in;
+    unsigned ttl = 2; // the level of recursion
     char *q = NULL, *w = NULL, *d = NULL;
 
     check_argv(argc, argv, &q, &w, &d);
-
-    struct in6_addr host_in6;
-    struct in_addr host_in;
-
-    int is_host_in6 = inet_pton(AF_INET6, q, &host_in6);
-    int is_host_in = inet_pton(AF_INET, q, &host_in);
 
     if (d != NULL)
       set_dns(d);
 
     try {
-        set_whost(w);
-        if (is_host_in == 1) {  
-            A ahost = A(host_in);
+        if (inet_pton(AF_INET, q, &((sockaddr_in *)&in)->sin_addr) == 1) {  
+            A ahost = A(((sockaddr_in *)&in)->sin_addr);
             auto arpa = ahost.asQuery();
             responses.push_back(async(launch::async, [ttl, s = move(arpa)]() { return query(s, QTYPE::ptr, ttl); }));
             auto str = ahost.toString();
-            while ((ret = whois_nquery(str.c_str(), AF_INET, whois_ans)) == -2) {
-                #ifdef DEBUG
-                STDOUT("[Redirecting to " << whois_ans << "] ...");
-                #endif
-                set_whost(whois_ans.c_str());
-            }
-            if (ret == -1)
-                throw runtime_error(string() + "whois query failed: " + strerror(ret));
-        } else if (is_host_in6 == 1) {
-            AAAA ahost = AAAA(host_in6);
+            whois_ans = whois_nquery(str, w);
+        } else if (inet_pton(AF_INET6, q, &((sockaddr_in6 *)&in)->sin6_addr) == 1) {
+            AAAA ahost = AAAA(((sockaddr_in6 *)&in)->sin6_addr);
             auto arpa = ahost.asQuery();
             responses.push_back(async(launch::async, [ttl, s = move(arpa)]() { return query(s, QTYPE::ptr, ttl); }));
-            // TODO: whois support for IPv6
+            auto str = ahost.toString();
+            whois_ans = whois_nquery(str, w);
         } else {
             responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::aaaa, ttl); }));
             responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::a, ttl); })); 
             responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::mx, ttl); })); 
             responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::soa, ttl); }));
+            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::ns, ttl); }));
+            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::cname, ttl); }));
         }
         // TODO: refactor
         for (auto &r : responses) {
@@ -591,19 +629,25 @@ int main(int argc, char *const *argv) {
 
         cout << "\n========= DNS =========\n\n";
 
-        for (auto &result : results)
-            result.printTree();
+        cout << q << endl;
+        unsigned cnt = 0;
+        for (auto &result : results) {
+            cnt++;
+            bool last = (cnt == results.size());
+            result.printTree("    ", last);
+        }
 
         cout <<"\n========= WHOIS =========\n\n";
         cout << whois_ans << endl;
     }
     catch(const runtime_error &error) {
-        STDERR(error.what());
+        cerr << error.what() << endl;
+        exit(EXIT_FAILURE);
+    }
+    catch(...) {
+        cerr << "Unknown error" << endl;
         exit(EXIT_FAILURE);
     }
 
-
     return EXIT_SUCCESS;
 }
-
-//  TODO: debug __LINE__ msgs
