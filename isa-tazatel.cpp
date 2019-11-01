@@ -59,7 +59,7 @@ struct RecordNode {
         cout << prefix << (last ? "└──" : "├──");
         auto desc = record->descr();
         cout << desc;
-        for (int i = 0; i < 6 - strlen(desc); ++i)
+        for (size_t i = 0; i < 6 - strlen(desc); ++i)
             cout << "─";
         cout << record->toString() << endl;
         unsigned cnt = 0;
@@ -485,18 +485,19 @@ int set_whost(string whost, sockaddr_storage *in, bool redirection = false) {
 static
 string whois_nquery(string ip, string whost) {
     int ret, sock, rsize, insize = rsize = sock = ret = 0;
-    char buf[1500] = {0}; // ethernet's datagram size
     bool redirection = false;
+    char buf[1500] = {0}; // ethernet's datagram size
     string response;
     sockaddr_storage in;
     ip.append("\r\n");
 
     do {
         response.clear();
-        redirection = false;
+        memset(&buf, 0, sizeof(buf)); 
         memset(&in, 0, sizeof(in));
-        if ((ret = set_whost(whost, &in, false)) < 0)
+        if ((ret = set_whost(whost, &in, redirection)) < 0)
             throw runtime_error(string() + "whost: " + hstrerror(h_errno));
+        redirection = false;
         insize = (ret == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6));
         if ((sock = socket(ret, SOCK_STREAM, IPPROTO_TCP)) == -1) {
             throw runtime_error(strerror(errno));
@@ -530,6 +531,9 @@ string whois_nquery(string ip, string whost) {
             throw runtime_error(strerror(errno));
         }
         close(sock);
+        #ifdef DEBUG
+        if (redirection) STDOUT("[REDIRECTING to " << whost << "...]");
+        #endif
     } while (redirection);
     return response;
 }
@@ -587,8 +591,8 @@ void set_dns(char *dnsip) {
 
 int main(int argc, char *const *argv) {
     vector<future<vector<RecordNode>>> responses;
+    future<string> whois_res;
     vector<RecordNode> results;
-    string whois_ans;
     sockaddr_storage in;
     unsigned ttl = 2; // the level of recursion
     char *q = NULL, *w = NULL, *d = NULL;
@@ -604,20 +608,29 @@ int main(int argc, char *const *argv) {
             auto arpa = ahost.asQuery();
             responses.push_back(async(launch::async, [ttl, s = move(arpa)]() { return query(s, QTYPE::ptr, ttl); }));
             auto str = ahost.toString();
-            whois_ans = whois_nquery(str, w);
+            whois_res = async(launch::async, [str, w]() { return whois_nquery(str, w); });
         } else if (inet_pton(AF_INET6, q, &((sockaddr_in6 *)&in)->sin6_addr) == 1) {
             AAAA ahost = AAAA(((sockaddr_in6 *)&in)->sin6_addr);
             auto arpa = ahost.asQuery();
             responses.push_back(async(launch::async, [ttl, s = move(arpa)]() { return query(s, QTYPE::ptr, ttl); }));
             auto str = ahost.toString();
-            whois_ans = whois_nquery(str, w);
+            whois_res = async(launch::async, [str, w]() { return whois_nquery(str, w); });
         } else {
             responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::aaaa, ttl); }));
-            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::a, ttl); })); 
+            auto ares = async(launch::async, [ttl, q]() { return query(q, QTYPE::a, ttl); }); 
             responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::mx, ttl); })); 
             responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::soa, ttl); }));
             responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::ns, ttl); }));
             responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::cname, ttl); }));
+            // TODO: refactor
+            auto arecs = ares.get();    // Get A records first
+            if (!arecs.empty()) {
+                auto ip = arecs.back().record->toString();
+                whois_res = async(launch::async, [ip, w]() { return whois_nquery(ip, w); });
+                results.insert(results.end(),   // insert them back to print them later on
+                    make_move_iterator(arecs.begin()),
+                    make_move_iterator(arecs.end()));
+            }
         }
         // TODO: refactor
         for (auto &r : responses) {
@@ -638,7 +651,8 @@ int main(int argc, char *const *argv) {
         }
 
         cout <<"\n========= WHOIS =========\n\n";
-        cout << whois_ans << endl;
+        if (whois_res.valid())
+            cout << whois_res.get() << endl;
     }
     catch(const runtime_error &error) {
         cerr << error.what() << endl;
