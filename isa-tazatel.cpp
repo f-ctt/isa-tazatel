@@ -249,11 +249,11 @@ parsedns(const u_char *rdata, int size, __ns_sect section, unsigned tarqtype) {
     int msg_count = 0;
     vector<unique_ptr<Record>> records;
     if ((ret = ns_initparse(rdata, size, &handle)) < 0)
-        throw runtime_error(hstrerror(ret));
-    msg_count = ns_msg_count(handle, ns_s_an);
+        throw runtime_error(string() + "initparse: " + hstrerror(ret));
+    msg_count = ns_msg_count(handle, section); // TODO: support for auth section in case SOA is not in the an section
     for (int i = 0; i < msg_count; ++i) {
         if ((ret = ns_parserr(&handle, section, i, &rr)) < 0)
-            throw runtime_error(hstrerror(ret));
+            throw runtime_error(string() + "parserr: " + hstrerror(ret));
         if ((actual_qtype = ns_rr_type(rr)) != tarqtype)
             continue; // NOTE: skipping an answer we didn't ask for
         cp = (u_char *)ns_rr_rdata(rr);
@@ -411,18 +411,23 @@ vector<RecordNode> query(string hname, QTYPE qt, unsigned ttl) {
     // it only works if glibc was build with debug option
     resstate.options |= RES_DEBUG; 
     #endif
-    
     if ((ret = res_nquery(&resstate, 
                 hname.c_str(), 
                 ns_c_in,
                 qt, 
                 buf, 
-                sizeof(buf))) > 0) {    // FIXME: not a desired behaviour (e.g. SOA)
+                sizeof(buf))) > 0) {  
         records = parsedns(buf, ret, ns_s_an, qt);
-    } 
+    } else if (qt == QTYPE::soa) {
+        // res_nquery returns -1, need to get the total len manually
+        int cnt = 512;
+        while (buf[--cnt] == '\0' && cnt > 0); // FIXME: not sure if reliable
+        records = parsedns(buf, cnt + 1, ns_s_ns, qt); // cnt + 1 -> idx + 1 to get the total len
+    }
     #ifdef DEBUG
-    else 
-        STDERR(hstrerror(h_errno) << ", " << qt << " " << hname << " " << ttl);
+        else {
+            STDERR(hstrerror(h_errno) << ", " << qt << " " << hname << " " << ttl);
+        }
     #endif
     while (!records.empty()) {
         root.push_back(RecordNode { move(records.back()) });
@@ -616,10 +621,10 @@ int main(int argc, char *const *argv) {
             auto str = ahost.toString();
             whois_res = async(launch::async, [str, w]() { return whois_nquery(str, w); });
         } else {
-            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::aaaa, ttl); }));
-            auto ares = async(launch::async, [ttl, q]() { return query(q, QTYPE::a, ttl); }); 
-            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::mx, ttl); })); 
             responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::soa, ttl); }));
+            auto ares = async(launch::async, [ttl, q]() { return query(q, QTYPE::a, ttl); }); 
+            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::aaaa, ttl); }));
+            responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::mx, ttl); })); 
             responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::ns, ttl); }));
             responses.push_back(async(launch::async, [ttl, q]() { return query(q, QTYPE::cname, ttl); }));
             // TODO: refactor
