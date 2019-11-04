@@ -25,8 +25,7 @@ static mutex STDERR_MX;
 #define STDERR(x) do { STDERR_MX.lock();cerr << __func__ << ":" <<__LINE__ << ": " << x << endl; STDERR_MX.unlock(); } while (0)
 #define STDOUT(x) do { STDOUT_MX.lock(); cout << x << endl; STDOUT_MX.unlock(); } while (0)
 
-static struct in6_addr DNS_IN6;
-static struct in_addr DNS_IN;
+static sockaddr_storage DNS_SADDR;
 static int TAR_AFINET_DNS = 0;
 
 enum QTYPE {
@@ -363,15 +362,14 @@ int res_setserver(res_state state, int af) {
     if (af == AF_INET) {
         state->nsaddr_list[0].sin_family = af;
         state->nsaddr_list[0].sin_port = htons(53);
-        state->nsaddr_list[0].sin_addr = DNS_IN;
+        state->nsaddr_list[0].sin_addr = ((sockaddr_in *)&DNS_SADDR)->sin_addr;
         state->_u._ext.nsaddrs[0] = NULL;
-
     } else if (af == AF_INET6) {
         state->nsaddr_list[0].sin_family = 0;
         sockaddr_in6 *sin6 = (sockaddr_in6 *) malloc(sizeof(sockaddr_in6));
         memset(sin6, 0, sizeof(sockaddr_in));
         sin6->sin6_scope_id = 0;
-        sin6->sin6_addr = DNS_IN6;
+        sin6->sin6_addr = ((sockaddr_in6 *)&DNS_SADDR)->sin6_addr;
         sin6->sin6_family = AF_INET6;
         sin6->sin6_port = htons(53);
         state->_u._ext.nsaddrs[0] = sin6;
@@ -418,10 +416,11 @@ vector<RecordNode> query(string hname, QTYPE qt, unsigned ttl) {
                 buf, 
                 sizeof(buf))) > 0) {  
         records = parsedns(buf, ret, ns_s_an, qt);
-    } else if (qt == QTYPE::soa) {
+    } else if (qt == QTYPE::soa && buf[9]) { // Test if there is an msg in authoritative section
         // res_nquery returns -1, need to get the total len manually
         int cnt = 512;
-        while (buf[--cnt] == '\0' && cnt > 0); // FIXME: not sure if reliable
+        while (buf[--cnt] == '\0' && cnt > 0); 
+        STDOUT("size: " << cnt);
         records = parsedns(buf, cnt + 1, ns_s_ns, qt); // cnt + 1 -> idx + 1 to get the total len
     }
     #ifdef DEBUG
@@ -546,9 +545,9 @@ string whois_nquery(string ip, string whost) {
 static
 void print_help() {
     cout << \
-        "\t-q <IP|hostname> Query\n" << \
-        "\t-w <IP|hostname> WHOIS server>\n" << \
-        "\t-d <IP> DNS server. Optional argument. By default, system configured DNS is used\n";
+        "\t-q <IPv4/6|hostname> Query\n" << \
+        "\t-w <IPv4/6|hostname> WHOIS server>\n" << \
+        "\t-d <IPv4/6> DNS server. Optional argument. DNS in /etc/resolv.conf is used by default\n";
 }
 
 static
@@ -580,11 +579,10 @@ void check_argv(int argc, char *const *argv, char **q, char **w, char **d) {
     }
 }
 
-// TODO: REFACTOR: use one buffer for both addresses
 static
 void set_dns(char *dnsip) {
-    if (inet_pton(AF_INET, dnsip, &DNS_IN) != 1) {
-        if (inet_pton(AF_INET6, dnsip, &DNS_IN6) != 1) {
+    if (inet_pton(AF_INET, dnsip, &((sockaddr_in *)&DNS_SADDR)->sin_addr) != 1) {
+        if (inet_pton(AF_INET6, dnsip, &((sockaddr_in6 *)&DNS_SADDR)->sin6_addr) != 1) {
             print_help();
             exit(EXIT_FAILURE);
         }
@@ -644,20 +642,6 @@ int main(int argc, char *const *argv) {
                 make_move_iterator(res_value.begin()),
                 make_move_iterator(res_value.end()));
         }
-
-        cout << "\n========= DNS =========\n\n";
-
-        cout << q << endl;
-        unsigned cnt = 0;
-        for (auto &result : results) {
-            cnt++;
-            bool last = (cnt == results.size());
-            result.printTree("    ", last);
-        }
-
-        cout <<"\n========= WHOIS =========\n\n";
-        if (whois_res.valid())
-            cout << whois_res.get() << endl;
     }
     catch(const runtime_error &error) {
         cerr << error.what() << endl;
@@ -667,6 +651,22 @@ int main(int argc, char *const *argv) {
         cerr << "Unknown error" << endl;
         exit(EXIT_FAILURE);
     }
+
+    cout << "\n========= DNS =========\n\n";
+
+    // TODO: 
+    // 
+    cout << q << endl;
+    unsigned cnt = 0;
+    for (auto &result : results) {
+        cnt++;
+        bool last = (cnt == results.size());
+        result.printTree("    ", last);
+    }
+
+    cout <<"\n========= WHOIS =========\n\n";
+    if (whois_res.valid())
+        cout << whois_res.get() << endl;
 
     return EXIT_SUCCESS;
 }
