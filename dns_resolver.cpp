@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <arpa/nameser.h>
 #include <string.h>
 #include <resolv.h>
 #include <future>
@@ -13,7 +14,7 @@ static int TAR_AFINET_DNS = 0;
 void set_dns(char *dnsip) {
     if (inet_pton(AF_INET, dnsip, &((sockaddr_in *)&DNS_SADDR)->sin_addr) != 1) {
         if (inet_pton(AF_INET6, dnsip, &((sockaddr_in6 *)&DNS_SADDR)->sin6_addr) != 1) {
-            STDERR(strerror(errno));
+            STDERR(dnsip << " is not a valid IP");
             exit(EXIT_FAILURE);
         }
         TAR_AFINET_DNS = AF_INET6;
@@ -295,7 +296,11 @@ parsedns(const u_char *rdata, int size, __ns_sect section, unsigned tarqtype) {
 RecordNodes dns_nquery(string hname, QTYPE qt, unsigned ttl) {
     struct __res_state resstate;
     int ret = 0;
-    u_char buf[NS_PACKETSZ] = {0};
+    union {
+        HEADER h;
+        u_char buf[NS_PACKETSZ] = {0};
+    } response;
+
     vector<unique_ptr<Record>> records; 
     vector<future<vector<RecordNode>>> responses;
     vector<RecordNode> root;
@@ -317,14 +322,14 @@ RecordNodes dns_nquery(string hname, QTYPE qt, unsigned ttl) {
                 hname.c_str(), 
                 ns_c_in,
                 qt, 
-                buf, 
-                sizeof(buf))) > 0) {  
-        records = parsedns(buf, ret, ns_s_an, qt);
-    } else if (qt == QTYPE::soa && buf[9]) { // Test if there is an msg in authoritative section
+                response.buf, 
+                sizeof(response))) > 0) {  
+        records = parsedns(response.buf, ret, ns_s_an, qt);
+    } else if (qt == QTYPE::soa && response.h.nscount && !response.h.rcode) { // Test if there is a msg in authoritative section
         // res_nquery returns -1, need to get the total len manually
         int cnt = 512;
-        while (buf[--cnt] == '\0' && cnt > 0); 
-        records = parsedns(buf, cnt + 1, ns_s_ns, qt); // cnt + 1 -> idx + 1 to get the total len
+        while (response.buf[--cnt] == '\0' && cnt > 0); 
+        records = parsedns(response.buf, cnt + 1, ns_s_ns, qt); // cnt + 1 -> idx + 1 to get the total len
     }
     #ifdef DEBUG
         else {

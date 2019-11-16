@@ -50,6 +50,7 @@ int main(int argc, char *const *argv) {
     vector<future<vector<RecordNode>>> responses;
     future<string> whois_res;
     RecordNodes results;
+    string whois_answer;
     sockaddr_storage in;
     unsigned ttl = 2; // the level of recursion
     char *q = NULL, *w = NULL, *d = NULL;
@@ -97,6 +98,9 @@ int main(int argc, char *const *argv) {
                 make_move_iterator(res_value.begin()),
                 make_move_iterator(res_value.end()));
         }
+
+        if (whois_res.valid())
+            whois_answer = whois_res.get();
     }
     catch(const runtime_error &error) {
         cerr << error.what() << endl;
@@ -109,19 +113,18 @@ int main(int argc, char *const *argv) {
 
     cout << "\n========= DNS =========\n\n";
 
-    // TODO: 
-    // 
-    cout << q << endl;
-    unsigned cnt = 0;
-    for (auto &result : results) {
-        cnt++;
-        bool last = (cnt == results.size());
-        result.printTree("    ", last);
+    if (!results.empty()) {
+        cout << q << endl;
+        unsigned cnt = 0;
+        for (auto &result : results) {
+            cnt++;
+            bool last = (cnt == results.size());
+            result.printTree("    ", last);
+        }
     }
 
     cout <<"\n========= WHOIS =========\n\n";
-    if (whois_res.valid())
-        cout << whois_res.get() << endl;
+    cout << whois_answer;
 
     return EXIT_SUCCESS;
 }
