@@ -298,7 +298,7 @@ RecordNodes dns_nquery(string hname, QTYPE qt, unsigned ttl) {
     int ret = 0;
     union {
         HEADER h;
-        u_char buf[NS_PACKETSZ] = {0};
+        u_char buf[NS_PACKETSZ];
     } response;
 
     vector<unique_ptr<Record>> records; 
@@ -306,6 +306,7 @@ RecordNodes dns_nquery(string hname, QTYPE qt, unsigned ttl) {
     vector<RecordNode> root;
 
     memset(&resstate, 0, sizeof(struct __res_state));
+    memset(&response, 255, sizeof(response));
     if ((ret = res_ninit(&resstate)) < 0)
         throw runtime_error(hstrerror(ret));
 
@@ -328,7 +329,7 @@ RecordNodes dns_nquery(string hname, QTYPE qt, unsigned ttl) {
     } else if (qt == QTYPE::soa && response.h.nscount && !response.h.rcode) { // Test if there is a msg in authoritative section
         // res_nquery returns -1, need to get the total len manually
         int cnt = 512;
-        while (response.buf[--cnt] == '\0' && cnt > 0); 
+        while (response.buf[--cnt] == 255 && cnt > 0); 
         records = parsedns(response.buf, cnt + 1, ns_s_ns, qt); // cnt + 1 -> idx + 1 to get the total len
     }
     #ifdef DEBUG
