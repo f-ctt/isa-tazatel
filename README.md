@@ -14,6 +14,7 @@ whois.cpp\
 whois.h\
 helpers.cpp\
 helpers.h\
+isa-tazatel.cpp\
 Makefile\
 README.md
 
