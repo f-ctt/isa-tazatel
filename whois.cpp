@@ -55,23 +55,30 @@ string whois_nquery(string ip, string whost) {
     string response;
     sockaddr_storage in;
     ip.append("\r\n");
+    struct timeval tv;
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
 
     do {
         response.clear();
         memset(&buf, 0, sizeof(buf)); 
         memset(&in, 0, sizeof(in));
         if ((ret = set_whost(whost, &in, redirection)) < 0)
-            throw runtime_error(string() + "whost: " + strerror(errno));
+            throw runtime_error(whost + " is not not valid hostname/IP");
         redirection = false;
         insize = (ret == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6));
         if ((sock = socket(ret, SOCK_STREAM, IPPROTO_TCP)) == -1) {
             throw runtime_error(strerror(errno));
         }
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv);
         if (connect(sock , (sockaddr *)&in, insize)) {
-            throw runtime_error(string() + "whost: " + strerror(errno));
+            const string& msg = (errno == EINPROGRESS ? "Cannot connect to " + whost : strerror(errno));
+            throw runtime_error(string() + "whois_nquery: " + msg);
         }
         if (send(sock, ip.c_str(), ip.size(), 0) < 0)
             throw runtime_error(strerror(errno));
+
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
         while ((rsize = recv(sock, buf, sizeof(buf), 0)) > 0) {
             size_t pos = string::npos;
             istringstream stream;
